@@ -67,6 +67,7 @@ interface ChargePointSnapshot {
   profileCount: number;
   heartbeatIntervalS: number | null; // from BootNotification response
   lastError: string | null;
+  updatedAt: string;             // time of the last state change of this box ("Stand" in the UI)
 }
 
 type FrameDirection = "out" | "in";   // out = box -> central system
@@ -96,6 +97,8 @@ interface ScenarioReport {
   finishedAt: string;
   outcome: "passed" | "failed" | "aborted";
   checks: CheckResult[];
+  chargePointLabel?: string;     // for the report header; absent in old reports
+  chargePointIdentity?: string;
 }
 
 // ── App view (plan section 4a) ──
@@ -134,6 +137,8 @@ interface AppViewSnapshot {
 | `abort_scenario` | `{ id }` | – |
 | `export_log` | `{ id }` | `string` (JSON array of `FrameLogEntry`) |
 | `export_report` | `{ report: ScenarioReport }` | `string` (Markdown) |
+| `save_log` | `{ id }` | `string` (absolute path of the written JSON file in the user's Downloads folder) |
+| `save_report` | `{ report: ScenarioReport }` | `string` (absolute path of the written Markdown file in Downloads) |
 | `app_redeem_invite` | `{ baseUrl, email, inviteToken, password }` | – |
 | `app_login` | `{ baseUrl, email, password }` | `AppLoginResult` |
 | `app_verify_device` | `{ code }` | – |
@@ -154,13 +159,27 @@ password or token.
 | `charge-point-updated` | `ChargePointSnapshot` (emitted on every state change, at most 4 per second per box) |
 | `frame-logged` | `FrameLogEntry` |
 | `charge-point-removed` | `{ id }` |
+| `restore-problem` | `{ message: string }` (German). A saved wallbox could not be restored at startup (password missing in the keychain, rejected by the core, damaged `boxes.json`). Delivered on the first `list_charge_points` call, one event per problem — the UI must subscribe before it lists. |
 
 ## 4. Fixed rules the core enforces (not the UI)
 
+- The effective target is derived from the URL host, not trusted from the UI: every host that is not
+  localhost/loopback/private IPv4 counts as live. `targetKind = "local"` with such a host is rejected.
+  Restored boxes are checked the same way.
+- Two boxes with the same normalized `baseUrl` + `identity` are rejected (they would push each other out).
 - Live: `add_charge_point` with `targetKind = "live"` fails unless `liveConfirmed = true`; at most 3 live boxes
   connected at the same time; `ws://` only for `localhost`, `127.0.0.1`, `::1` and private IPv4 ranges;
   certificate validation always on.
-- Scenarios with `liveAllowed = false` fail immediately on a live box.
+- Scenarios with `liveAllowed = false` fail immediately on a live box. The live limit applies to every
+  connect path, scenarios included.
+- After HTTP 401 or 429 a box refuses new connection attempts for 60 s (protects the server's per-IP
+  failure counter: 20 per 15 min).
+- Input bounds: label ≤ 60 chars, vendor/model ≤ 20, no control characters; password 1–200 printable ASCII;
+  maxPowerW and vehicle maxPowerW 1–350000; capacityKwh 1–300; clockOffsetS within ±86400; at most 20
+  boxes. baseUrl without userinfo, query or fragment.
+- Server-controlled values are clamped: heartbeat and meter interval ≥ 5 s; at most 50 profiles with 100
+  periods each; queued outgoing calls ≤ 100; incoming WebSocket messages ≤ 64 KiB; logged frames are cut
+  at 16 KiB.
 - OCPP password and app password/tokens live only in the OS keychain (service `de.ampiera.device-simulator`)
   and in memory; the Basic-Auth header and tokens are never logged or exported.
 - App polling at most every 30 s (`app_snapshot` returns the cached result if called sooner).
@@ -212,5 +231,5 @@ impl AppClient {
 
 The shell stores the OCPP password in the keychain on `add_charge_point` (account = local id) and passes it
 to `Simulator::add`; on app start it re-creates saved boxes from `boxes.json` in the app config directory
-(config only, never passwords) and reads passwords back from the keychain. The app `device_id` is a random
+(config and the `liveConfirmed` flag only, never passwords) and reads passwords back from the keychain. The app `device_id` is a random
 id created once and kept in the app config directory.
