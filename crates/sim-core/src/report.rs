@@ -24,13 +24,23 @@ fn check_text(outcome: CheckOutcome) -> &'static str {
 fn target_text(kind: TargetKind) -> &'static str {
     match kind {
         TargetKind::Local => "lokal",
-        TargetKind::Live => "live",
+        TargetKind::Live => "Produktivserver",
     }
 }
 
 /// Keeps a table cell on one line and stops text from breaking the table.
 fn cell(text: &str) -> String {
     text.replace('|', "\\|").replace(['\n', '\r'], " ")
+}
+
+/// "Label (identity)", or the id for reports written before label and identity were recorded.
+fn wallbox_text(report: &ScenarioReport) -> String {
+    match (&report.charge_point_label, &report.charge_point_identity) {
+        (Some(label), Some(identity)) => format!("{label} ({identity})"),
+        (Some(label), None) => label.clone(),
+        (None, Some(identity)) => identity.clone(),
+        (None, None) => report.charge_point_id.clone(),
+    }
 }
 
 /// Renders the report as Markdown.
@@ -46,7 +56,8 @@ pub fn report_to_markdown(report: &ScenarioReport) -> String {
         report.scenario_id, info.title
     );
     let _ = writeln!(text, "- Ergebnis: **{}**", outcome_text(report.outcome));
-    let _ = writeln!(text, "- Box: {}", report.charge_point_id);
+    // The internal UUID means nothing to a reader of the report; label and identity do.
+    let _ = writeln!(text, "- Wallbox: {}", wallbox_text(report));
     let _ = writeln!(text, "- Ziel: {}", target_text(report.target_kind));
     let _ = writeln!(text, "- Start: {}", report.started_at.format(format));
     let _ = writeln!(
@@ -83,6 +94,8 @@ mod tests {
         ScenarioReport {
             scenario_id: ScenarioId::S5,
             charge_point_id: "box-1".into(),
+            charge_point_label: Some("Wallbox 1".into()),
+            charge_point_identity: Some("AP-TEST-1".into()),
             target_kind: TargetKind::Local,
             started_at: start,
             finished_at: start + Duration::seconds(42),
@@ -115,6 +128,23 @@ mod tests {
         assert!(
             md.contains("| B\\|C | übersprungen | zwei Zeilen |"),
             "table cells are escaped"
+        );
+    }
+
+    #[test]
+    fn header_names_the_wallbox_by_label_and_identity_not_by_internal_id() {
+        let md = report_to_markdown(&report(vec![], ReportOutcome::Passed));
+        assert!(md.contains("- Wallbox: Wallbox 1 (AP-TEST-1)"), "{md}");
+        assert!(
+            !md.contains("box-1"),
+            "the internal id stays out of the report"
+        );
+        let mut old = report(vec![], ReportOutcome::Passed);
+        old.charge_point_label = None;
+        old.charge_point_identity = None;
+        assert!(
+            report_to_markdown(&old).contains("- Wallbox: box-1"),
+            "reports without label fall back to the id"
         );
     }
 

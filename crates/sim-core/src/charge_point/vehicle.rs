@@ -51,11 +51,6 @@ pub fn charging_power_w(
     allowed.max(0.0) * taper_factor(soc_pct)
 }
 
-/// Power the box would deliver without any profile; used by scenarios as the expectation after `validTo`.
-pub fn uncontrolled_power_w(box_max_w: f64, vehicle: &VehicleConfig, soc_pct: f64) -> f64 {
-    charging_power_w(box_max_w, vehicle.max_power_w, None, soc_pct)
-}
-
 /// Result of integrating one time step.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Integration {
@@ -207,10 +202,5 @@ mod tests {
         m.add_wh(0.2);
         assert!((m.energy_wh() - 10.6).abs() < 1e-12);
         assert_eq!(m.register_wh(), 11);
-    }
-
-    #[test]
-    fn uncontrolled_power_matches_hardware_minimum() {
-        assert_eq!(uncontrolled_power_w(7_000.0, &car(), 20.0), 7_000.0);
     }
 }

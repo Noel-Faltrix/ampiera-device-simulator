@@ -44,6 +44,9 @@ pub enum Frame {
 pub struct FrameError {
     /// Message id if readable.
     pub id: Option<String>,
+    /// True when the broken frame was a CALL. Only CALLs get an answer; answering a broken CALLRESULT or
+    /// CALLERROR with a CALLERROR would start an endless exchange (OCPP-J forbids it).
+    pub is_call: bool,
     /// What is wrong, German (shown as last error).
     pub message: String,
 }
@@ -85,6 +88,7 @@ impl ErrorCode {
 fn error(id: Option<String>, message: &str) -> FrameError {
     FrameError {
         id,
+        is_call: false,
         message: message.to_string(),
     }
 }
@@ -106,7 +110,10 @@ pub fn parse_frame(text: &str) -> Result<Frame, FrameError> {
         .ok_or_else(|| error(None, "Der Frame hat keine Nachrichten-ID."))?
         .to_string();
     match message_type {
-        MESSAGE_TYPE_CALL => parse_call(id, items),
+        MESSAGE_TYPE_CALL => parse_call(id, items).map_err(|mut e| {
+            e.is_call = true;
+            e
+        }),
         MESSAGE_TYPE_CALL_RESULT => {
             let payload = items
                 .get(2)
@@ -230,6 +237,20 @@ mod tests {
         assert_eq!(err.id.as_deref(), Some("id9"));
         let err = parse_frame(r#"[7,"id9"]"#).unwrap_err();
         assert_eq!(err.id.as_deref(), Some("id9"));
+        assert!(!err.is_call);
+    }
+
+    #[test]
+    fn only_broken_calls_are_marked_as_answerable() {
+        assert!(parse_frame(r#"[2,"a","OnlyThree"]"#).unwrap_err().is_call);
+        assert!(
+            !parse_frame(r#"[3,"a"]"#).unwrap_err().is_call,
+            "a broken CALLRESULT gets no answer"
+        );
+        assert!(
+            !parse_frame(r#"[4,"a"]"#).unwrap_err().is_call,
+            "a broken CALLERROR gets no answer"
+        );
     }
 
     #[test]

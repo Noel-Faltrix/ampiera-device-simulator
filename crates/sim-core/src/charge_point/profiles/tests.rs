@@ -1,5 +1,5 @@
 use super::*;
-use chrono::TimeZone;
+use chrono::{Duration, TimeZone};
 
 fn t0() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 6, 12, 0, 0).unwrap()
@@ -508,7 +508,56 @@ fn profile_json_from_the_backend_parses() {
     });
     let p: ChargingProfile = serde_json::from_value(json).unwrap();
     assert_eq!(p.charging_profile_id, 4711);
-    assert_eq!(remaining_validity(&p, t0()), Some(secs(900)));
+    assert_eq!(p.valid_to.map(|v| v - t0()), Some(secs(900)));
     let l = effective_limit([&p], t0(), 3).unwrap();
     assert!((l.limit_w - 10.7 * 690.0).abs() < 1e-9);
+}
+
+#[test]
+fn store_is_bounded_in_profiles_and_periods() {
+    let units = [RateUnit::W];
+    let c = ctx(&units, None);
+    let mut store = ProfileStore::new();
+    for n in 0..MAX_PROFILES as i64 {
+        let p = profile(
+            n,
+            ProfilePurpose::TxDefaultProfile,
+            n as u32,
+            RateUnit::W,
+            1.0,
+        );
+        store.set(0, p, &c, t0()).unwrap();
+    }
+    let extra = profile(
+        1000,
+        ProfilePurpose::TxDefaultProfile,
+        999,
+        RateUnit::W,
+        1.0,
+    );
+    assert_eq!(
+        store.set(0, extra, &c, t0()),
+        Err(ProfileRejection::TooManyProfiles)
+    );
+    assert_eq!(store.len(), MAX_PROFILES);
+    let replacing = profile(0, ProfilePurpose::TxDefaultProfile, 0, RateUnit::W, 2.0);
+    assert!(
+        store.set(0, replacing, &c, t0()).is_ok(),
+        "counter-check: replacing does not grow the store"
+    );
+
+    let mut many = profile(1, ProfilePurpose::TxDefaultProfile, 0, RateUnit::W, 1.0);
+    many.charging_schedule.charging_schedule_period = (0..=MAX_PERIODS as i64)
+        .map(|n| SchedulePeriod {
+            start_period: n * 10,
+            limit: 1.0,
+            number_phases: None,
+        })
+        .collect();
+    assert_eq!(
+        validate_profile(0, &many, &ctx(&units, None)),
+        Err(ProfileRejection::TooManyPeriods)
+    );
+    many.charging_schedule.charging_schedule_period.pop();
+    assert!(validate_profile(0, &many, &ctx(&units, None)).is_ok());
 }

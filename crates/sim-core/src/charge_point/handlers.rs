@@ -46,8 +46,8 @@ pub enum TriggerKind {
 pub enum Effect {
     /// Send the requested message.
     Trigger(TriggerKind),
-    /// Close the socket and connect again with a new BootNotification.
-    Reconnect,
+    /// End a running transaction with this reason, then reconnect with a new BootNotification.
+    Restart(StopReason),
     /// Send StopTransaction for this transaction.
     StopTransaction {
         /// The transaction that ended.
@@ -148,6 +148,15 @@ pub fn parse_interval(value: &str) -> Option<u32> {
     value.trim().parse::<u32>().ok()
 }
 
+/// Applies the floor to an interval from the central system; 0 means "off" and stays 0.
+pub fn clamp_interval(seconds: u32, floor: u32) -> u32 {
+    if seconds == 0 {
+        0
+    } else {
+        seconds.max(floor)
+    }
+}
+
 /// Applies a ChangeConfiguration and reports the outcome.
 pub fn change_configuration(state: &mut BoxState, key: &str, value: &str) -> ConfigStatus {
     if key.eq_ignore_ascii_case(KEY_SAMPLED_DATA) {
@@ -159,7 +168,7 @@ pub fn change_configuration(state: &mut BoxState, key: &str, value: &str) -> Con
     } else if key.eq_ignore_ascii_case(KEY_SAMPLE_INTERVAL) {
         match parse_interval(value) {
             Some(seconds) => {
-                state.meter_interval_s = seconds;
+                state.meter_interval_s = clamp_interval(seconds, state.min_interval_s);
                 ConfigStatus::Accepted
             }
             None => ConfigStatus::Rejected,
@@ -194,9 +203,9 @@ pub fn decide_trigger(requested: &str, connector_id: Option<u32>) -> TriggerDeci
     }
 }
 
-/// Rule for RemoteStartTransaction: only with a vehicle plugged in.
-pub fn remote_start_accepted(is_plugged: bool) -> bool {
-    is_plugged
+/// Rule for RemoteStartTransaction: only with a vehicle plugged in and no transaction running.
+pub fn remote_start_accepted(is_plugged: bool, transaction_running: bool) -> bool {
+    is_plugged && !transaction_running
 }
 
 /// Rule for RemoteStopTransaction: only for the running transaction.
@@ -276,7 +285,7 @@ pub fn handle_call(
         "Reset" => on_reset(payload),
         other => Handled::error(
             ErrorCode::NotImplemented,
-            format!("Die Aktion {other} wird von der simulierten Box nicht unterstützt."),
+            format!("Die Aktion {other} wird von der simulierten Wallbox nicht unterstützt."),
         ),
     }
 }
@@ -360,14 +369,15 @@ fn on_remote_start(state: &mut BoxState, payload: &Value) -> Handled {
         Ok(req) => req,
         Err(error) => return error,
     };
-    if !remote_start_accepted(state.is_plugged()) {
+    if !remote_start_accepted(state.is_plugged(), state.transaction().is_some()) {
         return Handled::status("Rejected");
     }
     state.prepare_new_transaction();
     if state.wants_transaction() {
         Handled::status("Accepted").with(Effect::StartTransaction { id_tag: req.id_tag })
     } else {
-        Handled::status("Accepted")
+        // Plugged in but nothing to start (e.g. a full vehicle after a stop): nothing changes.
+        Handled::status("Rejected")
     }
 }
 
@@ -390,10 +400,11 @@ fn on_remote_stop(state: &mut BoxState, payload: &Value) -> Handled {
 
 fn on_reset(payload: &Value) -> Handled {
     match parse::<ResetRequest>("Reset", payload) {
-        Ok(req) if matches!(req.reset_type.as_str(), "Soft" | "Hard") => {
-            Handled::status("Accepted").with(Effect::Reconnect)
-        }
-        Ok(_) => Handled::status("Rejected"),
+        Ok(req) => match req.reset_type.as_str() {
+            "Soft" => Handled::status("Accepted").with(Effect::Restart(StopReason::SoftReset)),
+            "Hard" => Handled::status("Accepted").with(Effect::Restart(StopReason::HardReset)),
+            _ => Handled::status("Rejected"),
+        },
         Err(error) => error,
     }
 }
@@ -473,6 +484,20 @@ mod tests {
             ConfigStatus::Accepted
         );
         assert_eq!(b.meter_interval_s, 15);
+        assert_eq!(
+            change_configuration(&mut b, KEY_SAMPLE_INTERVAL, "1"),
+            ConfigStatus::Accepted
+        );
+        assert_eq!(
+            b.meter_interval_s, b.min_interval_s,
+            "intervals below the floor are raised"
+        );
+        assert_eq!(
+            change_configuration(&mut b, KEY_SAMPLE_INTERVAL, "0"),
+            ConfigStatus::Accepted
+        );
+        assert_eq!(b.meter_interval_s, 0, "0 keeps meaning off");
+        change_configuration(&mut b, KEY_SAMPLE_INTERVAL, "15");
         assert_eq!(
             change_configuration(&mut b, KEY_SAMPLE_INTERVAL, "abc"),
             ConfigStatus::Rejected
@@ -681,11 +706,12 @@ mod tests {
         );
         b.begin_transaction(3, "AMPIERA", t0());
         let again = handle_call(&mut b, "RemoteStartTransaction", &payload, t0());
-        assert_eq!(result_status(&again), "Accepted");
-        assert!(
-            again.effects.is_empty(),
+        assert_eq!(
+            result_status(&again),
+            "Rejected",
             "a running transaction is not started twice"
         );
+        assert!(again.effects.is_empty());
     }
 
     #[test]
@@ -730,7 +756,9 @@ mod tests {
         let mut b = new_box();
         let h = handle_call(&mut b, "Reset", &json!({"type": "Soft"}), t0());
         assert_eq!(result_status(&h), "Accepted");
-        assert_eq!(h.effects, vec![Effect::Reconnect]);
+        assert_eq!(h.effects, vec![Effect::Restart(StopReason::SoftReset)]);
+        let hard = handle_call(&mut b, "Reset", &json!({"type": "Hard"}), t0());
+        assert_eq!(hard.effects, vec![Effect::Restart(StopReason::HardReset)]);
         assert_eq!(
             result_status(&handle_call(
                 &mut b,

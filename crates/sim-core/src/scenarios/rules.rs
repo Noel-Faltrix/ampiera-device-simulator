@@ -3,7 +3,7 @@
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 
-use crate::charge_point::profiles::{effective_limit, ChargingProfile};
+use crate::charge_point::profiles::ChargingProfile;
 use crate::charge_point::vehicle::charging_power_w;
 use crate::model::{CheckOutcome, CheckResult, ReportOutcome, VehicleConfig};
 
@@ -33,30 +33,123 @@ pub fn power_matches(actual: Option<f64>, expected: f64, tolerance_pct: f64) -> 
     (actual - expected).abs() <= allowed
 }
 
-/// Power the box should deliver under `limit_w` for this vehicle and state of charge.
-pub fn expected_limited_power(
-    limit_w: f64,
-    box_max_w: f64,
-    vehicle: &VehicleConfig,
-    soc_pct: f64,
-) -> f64 {
-    charging_power_w(box_max_w, vehicle.max_power_w, Some(limit_w), soc_pct)
+/// Voltage assumed when a limit is given in A. Written down here on purpose: the check must not share
+/// constants with the code under test.
+const NOMINAL_VOLTAGE_V: f64 = 230.0;
+
+/// The limit in W that the received `SetChargingProfile` payloads impose at `now`, read straight from the JSON
+/// and without the box's own profile evaluation.
+///
+/// Rules (OCPP 1.6): per purpose the valid profile with the highest `stackLevel` counts; a `TxProfile` replaces
+/// `TxDefaultProfile`; `ChargePointMaxProfile` caps the result. A profile is valid between `validFrom` and
+/// `validTo` and from `startSchedule` on; the period in force is the last one whose `startPeriod` has passed.
+/// Limits in A become `A x 230 V x numberPhases` (the box's phases when absent), limits in W stay as they are.
+/// Only schedules with a `startSchedule` are evaluated (the backend sends absolute profiles).
+pub fn limit_from_payloads(payloads: &[Value], now: DateTime<Utc>, box_phases: u8) -> Option<f64> {
+    let parse_time = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.with_timezone(&Utc))
+    };
+    // (purpose, stack level, limit in W)
+    let mut candidates: Vec<(String, i64, f64)> = Vec::new();
+    for payload in payloads {
+        let Some(profile) = payload.get("csChargingProfiles") else {
+            continue;
+        };
+        let valid_from = parse_time(profile.get("validFrom"));
+        let valid_to = parse_time(profile.get("validTo"));
+        if valid_from.is_some_and(|from| now < from) || valid_to.is_some_and(|to| now >= to) {
+            continue;
+        }
+        let Some(schedule) = profile.get("chargingSchedule") else {
+            continue;
+        };
+        let Some(start) = parse_time(schedule.get("startSchedule")) else {
+            continue;
+        };
+        let elapsed = (now - start).num_seconds();
+        if elapsed < 0 {
+            continue;
+        }
+        if schedule
+            .get("duration")
+            .and_then(Value::as_i64)
+            .is_some_and(|duration| elapsed >= duration)
+        {
+            continue;
+        }
+        let Some(periods) = schedule
+            .get("chargingSchedulePeriod")
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        let Some(period) = periods
+            .iter()
+            .filter(|p| {
+                p.get("startPeriod")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(i64::MAX)
+                    <= elapsed
+            })
+            .max_by_key(|p| p.get("startPeriod").and_then(Value::as_i64).unwrap_or(0))
+        else {
+            continue;
+        };
+        let Some(limit) = period.get("limit").and_then(Value::as_f64) else {
+            continue;
+        };
+        let limit_w = match schedule.get("chargingRateUnit").and_then(Value::as_str) {
+            Some("A") => {
+                let phases = period
+                    .get("numberPhases")
+                    .and_then(Value::as_u64)
+                    .map_or(f64::from(box_phases), |n| n as f64);
+                limit * NOMINAL_VOLTAGE_V * phases
+            }
+            _ => limit,
+        };
+        let purpose = profile
+            .get("chargingProfilePurpose")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let stack = profile
+            .get("stackLevel")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        candidates.push((purpose, stack, limit_w));
+    }
+    let best = |purpose: &str| {
+        candidates
+            .iter()
+            .filter(|(p, _, _)| p == purpose)
+            .max_by_key(|(_, stack, _)| *stack)
+            .map(|(_, _, limit)| *limit)
+    };
+    let tx = best("TxProfile").or_else(|| best("TxDefaultProfile"));
+    match (tx, best("ChargePointMaxProfile")) {
+        (Some(tx), Some(cap)) => Some(tx.min(cap)),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
 }
 
-/// Power the box should deliver at `now` given the profiles it accepted: the limit in force, or its own maximum
-/// when no profile applies (e.g. after `validTo`). Computed independently of the box's own evaluation.
-pub fn expected_power_now(
-    accepted: &[ChargingProfile],
+/// Power the box should deliver at `now` for the profiles it accepted: the limit from
+/// [`limit_from_payloads`], capped by the box maximum, the vehicle maximum and the vehicle's charging curve.
+/// Without a limit (e.g. after `validTo`) that is the box's own maximum.
+pub fn expected_power_from_payloads(
+    accepted: &[Value],
     now: DateTime<Utc>,
     box_phases: u8,
     box_max_w: f64,
     vehicle: &VehicleConfig,
     soc_pct: f64,
 ) -> f64 {
-    match effective_limit(accepted.iter(), now, box_phases) {
-        Some(limit) => expected_limited_power(limit.limit_w, box_max_w, vehicle, soc_pct),
-        None => charging_power_w(box_max_w, vehicle.max_power_w, None, soc_pct),
-    }
+    let limit = limit_from_payloads(accepted, now, box_phases);
+    charging_power_w(box_max_w, vehicle.max_power_w, limit, soc_pct)
 }
 
 /// Checks that `validTo` exists and lies at most `max` after `received_at` (the backend caps test limits at
@@ -68,7 +161,8 @@ pub fn valid_to_within(
 ) -> Result<Duration, String> {
     let Some(valid_to) = valid_to else {
         return Err(
-            "Das Profil hat kein validTo; die Box wüsste nie, wann ihre Pflicht endet.".to_string(),
+            "Das Profil hat kein validTo; die Wallbox wüsste nie, wann ihre Pflicht endet."
+                .to_string(),
         );
     };
     let remaining = valid_to - received_at;
@@ -217,11 +311,19 @@ pub fn check_post_boot_sequence(
     ))
 }
 
-/// Overall outcome: aborted wins, then any failed check, else passed. Skipped checks do not fail a run.
+/// Name of the check that reports a failed clean-up (reconnecting after the scenario). It is shown in the
+/// report but does not decide the verdict: the scenario's own checks do.
+pub const RESTORE_CHECK_NAME: &str = "Wiederverbindung nach dem Szenario";
+
+/// Overall outcome: aborted wins, then any failed check (except the clean-up check), else passed. Skipped
+/// checks do not fail a run.
 pub fn outcome_of(checks: &[CheckResult], aborted: bool) -> ReportOutcome {
     if aborted {
         ReportOutcome::Aborted
-    } else if checks.iter().any(|c| c.outcome == CheckOutcome::Failed) {
+    } else if checks
+        .iter()
+        .any(|c| c.outcome == CheckOutcome::Failed && c.name != RESTORE_CHECK_NAME)
+    {
         ReportOutcome::Failed
     } else {
         ReportOutcome::Passed
@@ -266,29 +368,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn expected_power_respects_vehicle_and_box() {
-        let v = VehicleConfig::default();
-        assert_eq!(expected_limited_power(4000.0, 11_000.0, &v, 20.0), 4000.0);
-        assert_eq!(
-            expected_limited_power(20_000.0, 11_000.0, &v, 20.0),
-            11_000.0
-        );
+    fn profile(purpose: &str, stack: i64, valid_to: &str, unit: &str, limit: f64) -> Value {
+        json!({"connectorId": 0, "csChargingProfiles": {
+            "chargingProfileId": stack, "stackLevel": stack, "chargingProfilePurpose": purpose,
+            "chargingProfileKind": "Absolute", "validTo": valid_to,
+            "chargingSchedule": {"startSchedule": "2026-10-06T11:59:00Z", "chargingRateUnit": unit,
+              "chargingSchedulePeriod": [{"startPeriod": 0, "limit": limit}]}}})
     }
 
     #[test]
     fn expected_power_follows_the_profile_until_valid_to_then_the_box_maximum() {
-        let payload = json!({"connectorId": 0, "csChargingProfiles": {
-            "chargingProfileId": 1, "stackLevel": 0, "chargingProfilePurpose": "TxDefaultProfile",
-            "chargingProfileKind": "Absolute", "validTo": "2026-10-06T12:10:00Z",
-            "chargingSchedule": {"startSchedule": "2026-10-06T11:59:00Z", "chargingRateUnit": "W",
-              "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 4000.0}]}}});
-        let profile = parse_set_profile(&payload).unwrap().1;
+        let payloads = [profile(
+            "TxDefaultProfile",
+            0,
+            "2026-10-06T12:10:00Z",
+            "W",
+            4000.0,
+        )];
         let v = VehicleConfig::default();
-        let during =
-            expected_power_now(std::slice::from_ref(&profile), t0(), 3, 11_000.0, &v, 20.0);
-        let after = expected_power_now(
-            std::slice::from_ref(&profile),
+        let during = expected_power_from_payloads(&payloads, t0(), 3, 11_000.0, &v, 20.0);
+        let after = expected_power_from_payloads(
+            &payloads,
             t0() + Duration::minutes(11),
             3,
             11_000.0,
@@ -299,6 +399,91 @@ mod tests {
         assert_eq!(
             after, 11_000.0,
             "counter-check: nothing limits the box after validTo"
+        );
+    }
+
+    #[test]
+    fn limits_in_ampere_use_230_volt_and_the_phases_of_the_payload_or_the_box() {
+        let mut payload = profile("TxDefaultProfile", 0, "2026-10-06T12:10:00Z", "A", 10.0);
+        let v = VehicleConfig::default();
+        assert_eq!(
+            expected_power_from_payloads(
+                std::slice::from_ref(&payload),
+                t0(),
+                3,
+                11_000.0,
+                &v,
+                20.0
+            ),
+            6900.0,
+            "10 A x 230 V x 3 box phases"
+        );
+        payload["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]
+            ["numberPhases"] = json!(1);
+        assert_eq!(
+            expected_power_from_payloads(
+                std::slice::from_ref(&payload),
+                t0(),
+                3,
+                11_000.0,
+                &v,
+                20.0
+            ),
+            2300.0,
+            "numberPhases of the period wins"
+        );
+    }
+
+    #[test]
+    fn expected_power_is_capped_by_box_and_vehicle_and_by_max_profiles() {
+        let v = VehicleConfig::default();
+        let big = [profile(
+            "TxDefaultProfile",
+            0,
+            "2026-10-06T12:10:00Z",
+            "W",
+            20_000.0,
+        )];
+        assert_eq!(
+            expected_power_from_payloads(&big, t0(), 3, 11_000.0, &v, 20.0),
+            11_000.0,
+            "the box maximum caps a huge limit"
+        );
+        let both = [
+            profile("TxDefaultProfile", 0, "2026-10-06T12:10:00Z", "W", 8000.0),
+            profile(
+                "ChargePointMaxProfile",
+                0,
+                "2026-10-06T12:10:00Z",
+                "W",
+                5000.0,
+            ),
+        ];
+        assert_eq!(
+            expected_power_from_payloads(&both, t0(), 3, 11_000.0, &v, 20.0),
+            5000.0
+        );
+    }
+
+    #[test]
+    fn the_highest_stack_level_and_a_tx_profile_win() {
+        let v = VehicleConfig::default();
+        let stacked = [
+            profile("TxDefaultProfile", 0, "2026-10-06T12:10:00Z", "W", 8000.0),
+            profile("TxDefaultProfile", 1, "2026-10-06T12:10:00Z", "W", 3000.0),
+        ];
+        assert_eq!(
+            expected_power_from_payloads(&stacked, t0(), 3, 11_000.0, &v, 20.0),
+            3000.0
+        );
+        let with_tx = [
+            profile("TxDefaultProfile", 5, "2026-10-06T12:10:00Z", "W", 3000.0),
+            profile("TxProfile", 0, "2026-10-06T12:10:00Z", "W", 6000.0),
+        ];
+        assert_eq!(
+            expected_power_from_payloads(&with_tx, t0(), 3, 11_000.0, &v, 20.0),
+            6000.0,
+            "counter-check: the TxProfile replaces the default even at a lower stack level"
         );
     }
 
@@ -428,5 +613,18 @@ mod tests {
         assert_eq!(outcome_of(&passed, false), ReportOutcome::Passed);
         assert_eq!(outcome_of(&failed, false), ReportOutcome::Failed);
         assert_eq!(outcome_of(&failed, true), ReportOutcome::Aborted);
+        let restore_failed = [
+            check(CheckOutcome::Passed),
+            CheckResult {
+                name: RESTORE_CHECK_NAME.into(),
+                outcome: CheckOutcome::Failed,
+                detail: String::new(),
+            },
+        ];
+        assert_eq!(
+            outcome_of(&restore_failed, false),
+            ReportOutcome::Passed,
+            "a failed clean-up is reported but does not decide the verdict"
+        );
     }
 }

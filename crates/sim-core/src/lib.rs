@@ -8,6 +8,7 @@
 
 pub mod charge_point;
 pub mod error;
+pub(crate) mod gate;
 pub mod handle;
 pub mod model;
 pub mod ocpp;

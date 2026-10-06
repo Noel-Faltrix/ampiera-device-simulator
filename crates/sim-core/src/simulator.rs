@@ -8,10 +8,10 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::error::SimError;
+use crate::gate::ConnectGate;
 use crate::handle::{BoxHandle, Timings};
 use crate::model::{
-    ChargePointConfig, ChargePointSnapshot, ConnectionState, ScenarioId, ScenarioInfo,
-    ScenarioReport, TargetKind, VehicleConfig,
+    ChargePointConfig, ChargePointSnapshot, ScenarioId, ScenarioInfo, ScenarioReport, VehicleConfig,
 };
 use crate::ocpp::actor;
 use crate::ocpp::client::Secret;
@@ -31,14 +31,31 @@ pub struct Settings {
     pub tuning: ScenarioTuning,
 }
 
+/// Abort switch of the scenario running on a box, if any. Shared with [`ScenarioSlot`], which clears it from
+/// `drop` (a synchronous context), so the slot is freed even when the scenario future is cancelled.
+type SharedSlot = Arc<Mutex<Option<watch::Sender<bool>>>>;
+
 struct BoxEntry {
     handle: BoxHandle,
     task: JoinHandle<()>,
-    /// Abort switch of the scenario running on this box, if any.
-    scenario_abort: Option<watch::Sender<bool>>,
+    scenario: SharedSlot,
+}
+
+/// Marks a box as "scenario running" and frees it again when dropped, however the run ends.
+struct ScenarioSlot(SharedSlot);
+
+impl Drop for ScenarioSlot {
+    fn drop(&mut self) {
+        let mut slot = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = None;
+    }
 }
 
 struct Inner {
+    gate: Arc<ConnectGate>,
     sink: Arc<dyn EventSink>,
     settings: Settings,
     probe: Mutex<Option<Arc<dyn AppProbe>>>,
@@ -58,15 +75,6 @@ fn find(boxes: &[BoxEntry], id: &str) -> Result<usize, SimError> {
         .ok_or_else(|| SimError::UnknownBox(id.to_string()))
 }
 
-fn is_active(connection: &ConnectionState) -> bool {
-    matches!(
-        connection,
-        ConnectionState::Connecting
-            | ConnectionState::Connected { .. }
-            | ConnectionState::Reconnecting { .. }
-    )
-}
-
 impl Simulator {
     /// A simulator with production timings.
     pub fn new(sink: Arc<dyn EventSink>) -> Self {
@@ -77,6 +85,7 @@ impl Simulator {
     pub fn with_settings(sink: Arc<dyn EventSink>, settings: Settings) -> Self {
         Self {
             inner: Arc::new(Inner {
+                gate: Arc::new(ConnectGate::default()),
                 sink,
                 settings,
                 probe: Mutex::new(None),
@@ -111,19 +120,31 @@ impl Simulator {
         live_confirmed: bool,
     ) -> Result<String, SimError> {
         policy::validate_new_box(&config, live_confirmed)?;
+        policy::validate_password(&password)?;
         let id = Uuid::new_v4().to_string();
         let (handle, task) = actor::spawn(
             id.clone(),
-            config,
+            config.clone(),
             Secret::new(password),
             self.inner.sink.clone(),
             self.inner.settings.timings.clone(),
+            self.inner.gate.clone(),
         );
+        // Box count and duplicate address are checked in the registry under its lock; a refused box is stopped
+        // again before anyone has seen it.
+        if let Err(error) = self
+            .inner
+            .gate
+            .register(&id, &config, handle.watch_snapshot())
+        {
+            task.abort();
+            return Err(error);
+        }
         self.inner.sink.charge_point_updated(&handle.snapshot());
         self.inner.boxes.lock().await.push(BoxEntry {
             handle,
             task,
-            scenario_abort: None,
+            scenario: Arc::new(Mutex::new(None)),
         });
         Ok(id)
     }
@@ -135,7 +156,12 @@ impl Simulator {
             let index = find(&boxes, id)?;
             boxes.remove(index)
         };
-        if let Some(abort) = &entry.scenario_abort {
+        let running = entry
+            .scenario
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().cloned());
+        if let Some(abort) = running {
             // The scenario may have ended already; then nobody listens.
             let _ = abort.send(true);
         }
@@ -147,6 +173,8 @@ impl Simulator {
         {
             task.abort();
         }
+        // Only now is the box really gone: its live slot is free after the actor has stopped.
+        self.inner.gate.unregister(id);
         self.inner.sink.charge_point_removed(id);
         Ok(())
     }
@@ -157,25 +185,10 @@ impl Simulator {
         Ok(boxes[index].handle.clone())
     }
 
-    /// Opens the connection; for live boxes at most 3 may be active at the same time.
+    /// Opens the connection. Towards the Produktivserver at most 3 boxes may be active at the same time; the
+    /// check lives in the box handle, so scenarios are held to it as well.
     pub async fn connect(&self, id: &str) -> Result<(), SimError> {
-        let boxes = self.inner.boxes.lock().await;
-        let index = find(&boxes, id)?;
-        let snapshot = boxes[index].handle.snapshot();
-        if snapshot.config.target_kind == TargetKind::Live && !is_active(&snapshot.connection) {
-            let others = boxes
-                .iter()
-                .filter(|b| b.handle.id != id)
-                .map(|b| b.handle.snapshot())
-                .filter(|s| s.config.target_kind == TargetKind::Live && is_active(&s.connection))
-                .count();
-            if policy::live_limit_reached(others) {
-                return Err(SimError::TooManyLiveBoxes {
-                    max: policy::MAX_LIVE_BOXES_CONNECTED,
-                });
-            }
-        }
-        boxes[index].handle.connect().await
+        self.handle_of(id).await?.connect().await
     }
 
     /// Closes the connection and stays offline.
@@ -203,27 +216,35 @@ impl Simulator {
         scenarios::catalog()
     }
 
-    /// Runs a scenario on a box and returns its report. Scenarios that must not touch live fail immediately.
+    /// Runs a scenario on a box and returns its report. Scenarios that must not touch the Produktivserver fail
+    /// immediately.
     pub async fn run_scenario(
         &self,
         id: &str,
         scenario: ScenarioId,
     ) -> Result<ScenarioReport, SimError> {
         let info = scenarios::info(scenario);
-        let (handle, abort_rx) = {
-            let mut boxes = self.inner.boxes.lock().await;
+        let (handle, abort_rx, _slot) = {
+            let boxes = self.inner.boxes.lock().await;
             let index = find(&boxes, id)?;
-            let entry = &mut boxes[index];
-            if !info.live_allowed && entry.handle.snapshot().config.target_kind == TargetKind::Live
-            {
+            let entry = &boxes[index];
+            if !scenarios::allowed_on(&info, &entry.handle.snapshot().config) {
                 return Err(SimError::ScenarioNotAllowedOnLive(scenario));
             }
-            if entry.scenario_abort.is_some() {
+            let mut slot = entry
+                .scenario
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.is_some() {
                 return Err(SimError::ScenarioAlreadyRunning);
             }
             let (abort_tx, abort_rx) = watch::channel(false);
-            entry.scenario_abort = Some(abort_tx);
-            (entry.handle.clone(), abort_rx)
+            *slot = Some(abort_tx);
+            (
+                entry.handle.clone(),
+                abort_rx,
+                ScenarioSlot(entry.scenario.clone()),
+            )
         };
         let probe = self.inner.probe.lock().ok().and_then(|slot| slot.clone());
         let ctx = ScenarioCtx::new(
@@ -233,19 +254,19 @@ impl Simulator {
             probe,
             abort_rx,
         );
-        let report = scenarios::run(scenario, ctx).await;
-        let mut boxes = self.inner.boxes.lock().await;
-        if let Ok(index) = find(&boxes, id) {
-            boxes[index].scenario_abort = None;
-        }
-        Ok(report)
+        Ok(scenarios::run(scenario, ctx).await)
     }
 
     /// Asks the running scenario of a box to stop; its report then has the outcome `aborted`.
     pub async fn abort_scenario(&self, id: &str) -> Result<(), SimError> {
         let boxes = self.inner.boxes.lock().await;
         let index = find(&boxes, id)?;
-        match &boxes[index].scenario_abort {
+        let running = boxes[index]
+            .scenario
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().cloned());
+        match running {
             Some(abort) => {
                 // The scenario may have finished a moment ago; aborting a finished run is harmless.
                 let _ = abort.send(true);

@@ -12,11 +12,13 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};
 use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::{
     connect_async_tls_with_config, Connector, MaybeTlsStream, WebSocketStream,
 };
 use url::Url;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// An open websocket to the central system.
 pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -27,8 +29,12 @@ pub const OCPP_SUBPROTOCOL: &str = "ocpp1.6";
 /// Longest part of an HTTP error body kept for diagnostics.
 const MAX_BODY_CHARS: usize = 200;
 
-/// A password that never shows up in `Debug` output or logs.
-#[derive(Clone)]
+/// Largest websocket message and frame accepted. OCPP messages of this simulator are a few KB; the limit keeps
+/// a misbehaving central system from making the box buffer megabytes.
+pub const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// A password that never shows up in `Debug` output or logs and is wiped from memory when dropped.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct Secret(String);
 
 impl Secret {
@@ -69,10 +75,12 @@ pub fn endpoint_url(base_url: &str, identity: &str) -> Result<Url, String> {
 }
 
 /// `Authorization` header value for HTTP Basic auth. Built in memory, never logged or stored.
-pub fn basic_auth_value(identity: &str, password: &str) -> String {
+/// The temporary strings that contain the password are wiped when the returned value is dropped.
+pub fn basic_auth_value(identity: &str, password: &str) -> Zeroizing<String> {
+    let plain = Zeroizing::new(format!("{identity}:{password}"));
     let encoded =
-        base64::engine::general_purpose::STANDARD.encode(format!("{identity}:{password}"));
-    format!("Basic {encoded}")
+        Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(plain.as_bytes()));
+    Zeroizing::new(format!("Basic {}", encoded.as_str()))
 }
 
 /// Delay before reconnect attempt number `attempt` (1-based): `base`, 2x, 4x ... capped at `max`.
@@ -128,12 +136,12 @@ pub fn classify_error(error: &WsError) -> ConnectFailure {
                 ),
                 404 => (
                     false,
-                    "Die Zentrale kennt diesen Pfad nicht (HTTP 404): Basisadresse und Kennung prüfen.".to_string(),
+                    "Die Zentrale kennt diesen Pfad nicht (HTTP 404): Prüfe Basisadresse und Kennung.".to_string(),
                 ),
                 429 => (
                     false,
-                    "Die Zentrale hat zu viele Fehlversuche von dieser Adresse gezählt (HTTP 429). Einige Minuten \
-                     warten, dann erneut verbinden."
+                    "Die Zentrale hat zu viele Fehlversuche von dieser Adresse gezählt (HTTP 429). Warte einige \
+                     Minuten und verbinde dann erneut."
                         .to_string(),
                 ),
                 other => (true, format!("Die Zentrale hat den Verbindungsaufbau mit HTTP {other} abgelehnt.")),
@@ -185,8 +193,8 @@ pub async fn connect(
             format!("Die Adresse der Zentrale ist ungültig ({e})."),
         )
     })?;
-    let mut auth =
-        HeaderValue::from_str(&basic_auth_value(identity, password.expose())).map_err(|_| {
+    let mut auth = HeaderValue::from_str(basic_auth_value(identity, password.expose()).as_str())
+        .map_err(|_| {
             failure(
                 false,
                 "Kennung oder Passwort enthalten Zeichen, die nicht übertragen werden können.",
@@ -199,14 +207,17 @@ pub async fn connect(
         HeaderValue::from_static(OCPP_SUBPROTOCOL),
     );
     let connector = Connector::Rustls(tls_config());
-    let attempt = connect_async_tls_with_config(request, None, false, Some(connector));
+    let limits = WebSocketConfig::default()
+        .max_message_size(Some(MAX_WS_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_WS_MESSAGE_BYTES));
+    let attempt = connect_async_tls_with_config(request, Some(limits), false, Some(connector));
     match tokio::time::timeout(timeout, attempt).await {
         Ok(Ok((stream, _response))) => Ok(stream),
         Ok(Err(error)) => Err(classify_error(&error)),
         Err(_) => Err(failure(
             true,
             format!(
-                "Zeitüberschreitung: die Zentrale hat nicht innerhalb von {} s geantwortet.",
+                "Zeitlimit überschritten: die Zentrale hat nicht innerhalb von {} s geantwortet.",
                 timeout.as_secs()
             ),
         )),
@@ -245,7 +256,10 @@ mod tests {
 
     #[test]
     fn basic_auth_matches_the_rfc_example_shape() {
-        assert_eq!(basic_auth_value("user", "pass"), "Basic dXNlcjpwYXNz");
+        assert_eq!(
+            basic_auth_value("user", "pass").as_str(),
+            "Basic dXNlcjpwYXNz"
+        );
     }
 
     #[test]

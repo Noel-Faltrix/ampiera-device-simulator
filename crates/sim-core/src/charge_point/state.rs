@@ -23,6 +23,10 @@ pub const DEFAULT_METER_INTERVAL_S: u32 = 60;
 /// Measurands the box reports until the central system changes `MeterValuesSampledData`.
 pub const DEFAULT_SAMPLED_DATA: &str = "Power.Active.Import,Energy.Active.Import.Register";
 
+/// Smallest interval (heartbeat, MeterValues) the central system can impose on the box. Without a floor a
+/// misconfigured or hostile server could make the box send every few milliseconds. 0 stays "off" for MeterValues.
+pub const MIN_INTERVAL_S: u32 = 5;
+
 /// Longest simulated step. A task that was starved (suspended laptop) would otherwise integrate minutes of
 /// charging in one go and make the meter jump.
 pub const MAX_STEP_S: f64 = 10.0;
@@ -34,6 +38,12 @@ pub enum StopReason {
     EVDisconnected,
     /// Stopped by RemoteStopTransaction.
     Remote,
+    /// Soft Reset from the central system.
+    SoftReset,
+    /// Hard Reset from the central system.
+    HardReset,
+    /// Restart triggered from the UI.
+    Reboot,
 }
 
 impl StopReason {
@@ -42,6 +52,9 @@ impl StopReason {
         match self {
             Self::EVDisconnected => "EVDisconnected",
             Self::Remote => "Remote",
+            Self::SoftReset => "SoftReset",
+            Self::HardReset => "HardReset",
+            Self::Reboot => "Reboot",
         }
     }
 }
@@ -87,8 +100,12 @@ pub struct BoxState {
     pub heartbeat_interval_s: Option<u32>,
     /// Last error worth showing, German.
     pub last_error: Option<String>,
+    /// Time of the last published change.
+    pub updated_at: DateTime<Utc>,
     /// MeterValueSampleInterval; 0 disables periodic MeterValues.
     pub meter_interval_s: u32,
+    /// Floor for intervals set by the central system ([`MIN_INTERVAL_S`] unless a test lowers it).
+    pub min_interval_s: u32,
     /// MeterValuesSampledData as a list.
     pub sampled_data: Vec<String>,
     /// idTag for the next transaction start.
@@ -112,7 +129,9 @@ impl BoxState {
             connection: ConnectionState::Disconnected,
             heartbeat_interval_s: None,
             last_error: None,
+            updated_at: Utc::now(),
             meter_interval_s: DEFAULT_METER_INTERVAL_S,
+            min_interval_s: MIN_INTERVAL_S,
             sampled_data: DEFAULT_SAMPLED_DATA
                 .split(',')
                 .map(str::to_string)
@@ -257,9 +276,11 @@ impl BoxState {
         }
     }
 
-    /// Allows a new transaction after a remote stop while the vehicle is still plugged in.
+    /// Allows a new transaction after a stop (remote stop, reset) while the vehicle is still plugged in and not
+    /// full: a full vehicle would only produce an empty transaction.
     pub fn prepare_new_transaction(&mut self) {
-        if self.vehicle.is_some() && self.phase == Phase::Finishing {
+        let full = self.vehicle.as_ref().is_some_and(|v| is_full(v.soc_pct));
+        if self.vehicle.is_some() && !full && self.phase == Phase::Finishing {
             self.phase = Phase::Preparing;
         }
     }
@@ -326,6 +347,7 @@ impl BoxState {
             profile_count: self.store.len(),
             heartbeat_interval_s: self.heartbeat_interval_s,
             last_error: self.last_error.clone(),
+            updated_at: self.updated_at,
         }
     }
 }

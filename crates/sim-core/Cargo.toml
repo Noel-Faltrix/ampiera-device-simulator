@@ -19,3 +19,4 @@ url = "2"
 async-trait = "0.1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
+zeroize = { version = "1", features = ["derive"] }

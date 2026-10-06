@@ -2,7 +2,7 @@
 //!
 //! Everything here is pure: the caller passes `now`, nothing reads the clock.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{ActiveLimit, ProfilePurpose, RateUnit};
@@ -10,6 +10,12 @@ use crate::model::{ActiveLimit, ProfilePurpose, RateUnit};
 /// Grid voltage used to convert amperes to watts. Same value as the backend's `NETZSPANNUNG_V`, so a limit
 /// the backend computed in W is reproduced exactly when it sent it in A.
 pub const GRID_VOLTAGE_V: f64 = 230.0;
+
+/// Most profiles a box keeps. The central system controls what arrives; without a bound it could fill memory.
+pub const MAX_PROFILES: usize = 50;
+
+/// Most periods in one schedule (same reason).
+pub const MAX_PERIODS: usize = 100;
 
 const SECONDS_PER_DAY: i64 = 86_400;
 const SECONDS_PER_WEEK: i64 = 7 * SECONDS_PER_DAY;
@@ -103,13 +109,19 @@ pub enum ProfileRejection {
     InvalidSchedule,
     /// Absolute/Recurring without `startSchedule`, or Recurring without `recurrencyKind`.
     MissingStart,
+    /// The store already holds the maximum number of profiles.
+    TooManyProfiles,
+    /// The schedule has more periods than allowed.
+    TooManyPeriods,
 }
 
 impl ProfileRejection {
     /// German explanation.
     pub fn describe(&self) -> &'static str {
         match self {
-            Self::UnknownConnector => "Die Box hat nur den Anschluss 1 (und 0 für die ganze Box).",
+            Self::UnknownConnector => {
+                "Die Wallbox hat nur den Anschluss 1 (und 0 für die ganze Wallbox)."
+            }
             Self::MaxProfileNeedsConnectorZero => {
                 "Ein ChargePointMaxProfile muss für Anschluss 0 gelten."
             }
@@ -117,16 +129,22 @@ impl ProfileRejection {
                 "Ein TxProfile braucht eine laufende, passende Transaktion."
             }
             Self::UnitNotAccepted => {
-                "Die Einheit des Ladeprofils wird von dieser Box nicht akzeptiert."
+                "Die Einheit des Ladeprofils wird von dieser Wallbox nicht akzeptiert."
             }
             Self::BoxRejectsProfiles => {
-                "Die Box ist so eingestellt, dass sie alle Ladeprofile ablehnt."
+                "Die Wallbox ist so eingestellt, dass sie alle Ladeprofile ablehnt."
             }
             Self::InvalidSchedule => {
                 "Der Ladeplan ist ungültig (Perioden fehlen, nicht aufsteigend oder negativ)."
             }
             Self::MissingStart => {
                 "Dem Ladeprofil fehlt der Startzeitpunkt oder die Wiederholungsart."
+            }
+            Self::TooManyProfiles => {
+                "Die Wallbox speichert höchstens 50 Ladeprofile; weitere werden abgelehnt."
+            }
+            Self::TooManyPeriods => {
+                "Ein Ladeplan darf höchstens 100 Perioden haben; dieser hat mehr."
             }
         }
     }
@@ -207,6 +225,9 @@ fn tx_profile_matches(
 
 fn validate_schedule(profile: &ChargingProfile) -> Result<(), ProfileRejection> {
     let periods = &profile.charging_schedule.charging_schedule_period;
+    if periods.len() > MAX_PERIODS {
+        return Err(ProfileRejection::TooManyPeriods);
+    }
     let ascending = periods
         .windows(2)
         .all(|w| w[0].start_period < w[1].start_period);
@@ -274,13 +295,18 @@ impl ProfileStore {
             profile.charging_schedule.start_schedule =
                 Some(ctx.transaction.map_or(now, |(_, started)| started));
         }
-        self.entries.retain(|e| {
+        let replaced_by_new = |e: &StoredProfile| {
             let same_id = e.profile.charging_profile_id == profile.charging_profile_id;
             let same_slot = e.connector_id == connector_id
                 && e.profile.charging_profile_purpose == profile.charging_profile_purpose
                 && e.profile.stack_level == profile.stack_level;
-            !(same_id || same_slot)
-        });
+            same_id || same_slot
+        };
+        let remaining = self.entries.iter().filter(|e| !replaced_by_new(e)).count();
+        if remaining >= MAX_PROFILES {
+            return Err(ProfileRejection::TooManyProfiles);
+        }
+        self.entries.retain(|e| !replaced_by_new(e));
         self.entries.push(StoredProfile {
             connector_id,
             profile,
@@ -433,11 +459,6 @@ pub fn effective_limit<'a>(
         purpose: winner.profile.charging_profile_purpose,
         valid_to: winner.profile.valid_to,
     })
-}
-
-/// Seconds until the validity of the profile ends, for tests and scenario text.
-pub fn remaining_validity(profile: &ChargingProfile, now: DateTime<Utc>) -> Option<Duration> {
-    profile.valid_to.map(|to| to - now)
 }
 
 #[cfg(test)]

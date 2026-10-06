@@ -6,6 +6,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use super::ctx::{ScenarioCtx, Wait};
+use super::rules::RESTORE_CHECK_NAME;
 use crate::handle::BoxEvent;
 use crate::model::ConnectionState;
 use crate::ocpp::client::{self, ConnectFailure, Secret};
@@ -33,10 +34,8 @@ pub fn judge_failures(
             "Statuscodes der Versuche: {statuses:?}; erwartet jedes Mal 401."
         ))
     };
-    let bodies: Vec<String> = failures
-        .iter()
-        .map(|f| f.body.clone().unwrap_or_default())
-        .collect();
+    // Attempts without a recorded body (none was sent) do not take part in the comparison.
+    let bodies: Vec<String> = failures.iter().filter_map(|f| f.body.clone()).collect();
     let identical = bodies.windows(2).all(|w| w[0] == w[1]);
     let hint = bodies
         .iter()
@@ -56,19 +55,21 @@ pub fn judge_failures(
     (status_result, hint_result)
 }
 
-/// S10 entry point.
+/// S10 entry point: three attempts in total. The first two go through a separate connection, the third through
+/// the wallbox itself, so the same attempt also shows whether the wallbox retries on its own after a 401.
 pub async fn s10_wrong_password(ctx: &mut ScenarioCtx) {
     let snapshot = ctx.handle.snapshot();
-    let was_connected = matches!(snapshot.connection, ConnectionState::Connected { .. });
+    let was_connected = ctx.is_connected();
     // A random wrong password: a fixed one could coincide with a real one on a test system.
     let wrong = Secret::new(format!("falsch-{}", Uuid::new_v4()));
+    let timeout = ctx.handle.timings().connect_timeout;
     let mut failures = Vec::new();
-    for _ in 0..ATTEMPTS {
+    for _ in 0..ATTEMPTS - 1 {
         match client::connect(
             &snapshot.config.base_url,
             &snapshot.config.identity,
             &wrong,
-            Duration::from_secs(15),
+            timeout,
         )
         .await
         {
@@ -83,10 +84,18 @@ pub async fn s10_wrong_password(ctx: &mut ScenarioCtx) {
             Err(failure) => failures.push(failure),
         }
     }
-    let (status, hint) = judge_failures(&failures);
-    record(ctx, "HTTP 401 bei jedem Versuch", status);
-    record(ctx, "Kein Hinweis, welcher Teil falsch war", hint);
-    check_no_automatic_retry(ctx, wrong).await;
+    let judged_ok = match attempt_through_box(ctx, wrong).await {
+        Some(failure) => {
+            failures.push(failure);
+            true
+        }
+        None => false,
+    };
+    if judged_ok {
+        let (status, hint) = judge_failures(&failures);
+        record(ctx, "HTTP 401 bei jedem Versuch", status);
+        record(ctx, "Kein Hinweis, welcher Teil falsch war", hint);
+    }
     restore_connection(ctx, was_connected).await;
 }
 
@@ -97,50 +106,68 @@ fn record(ctx: &mut ScenarioCtx, name: &str, outcome: Result<String, String>) {
     }
 }
 
-async fn check_no_automatic_retry(ctx: &mut ScenarioCtx, wrong: Secret) {
+/// The third attempt: the wallbox connects with the wrong password and must stop after the 401. Returns what
+/// the central system answered; `None` when the attempt could not be made or judged (a check says why).
+async fn attempt_through_box(ctx: &mut ScenarioCtx, wrong: Secret) -> Option<ConnectFailure> {
     const NAME: &str = "Kein automatischer Wiederholversuch nach 401";
     if let Err(error) = ctx.handle.disconnect().await {
         ctx.fail(NAME, error.to_string());
-        return;
+        return None;
     }
     if let Err(error) = ctx.handle.set_password(wrong).await {
         ctx.fail(NAME, error.to_string());
-        return;
+        return None;
     }
     let mut rx = ctx.handle.subscribe();
-    if let Err(error) = ctx.handle.connect().await {
+    if let Err(error) = ctx.connect_box().await {
         ctx.fail(NAME, error.to_string());
-        return;
+        return None;
     }
     let within = ctx.tuning.connect_wait;
-    let failed = ctx
-        .wait_snapshot(within, |s| {
-            matches!(s.connection, ConnectionState::Failed { .. })
+    let failure = match ctx
+        .wait_event(&mut rx, within, |event| match event {
+            BoxEvent::ConnectFailed { http_status, body } => Some(ConnectFailure {
+                retryable: false,
+                reason: String::new(),
+                http_status: *http_status,
+                body: body.clone(),
+            }),
+            _ => None,
         })
-        .await;
-    match failed {
-        Wait::Ready(_) => {}
+        .await
+    {
+        Wait::Ready(failure) => failure,
         Wait::TimedOut => {
-            ctx.fail(NAME, "Die Box ist nach dem abgelehnten Versuch nicht in den Zustand „fehlgeschlagen“ gewechselt.");
-            return;
+            ctx.fail(
+                NAME,
+                "Die Wallbox hat den abgelehnten Versuch nicht gemeldet.",
+            );
+            return None;
         }
-        Wait::Aborted => return,
-    }
+        Wait::Aborted => return None,
+    };
     let observe = ctx.tuning.no_retry_observation;
-    let attempts = count_attempts(ctx, &mut rx, observe).await;
+    let further = count_attempts(ctx, &mut rx, observe).await;
     let still_failed = matches!(
         ctx.handle.snapshot().connection,
         ConnectionState::Failed { .. }
     );
     ctx.check(
-        attempts <= 1 && still_failed,
+        further == 0 && still_failed,
         NAME,
-        format!("In {} s nach dem Fehler kam kein weiterer Verbindungsversuch.", observe.as_secs()),
-        format!("Die Box hat {attempts} Verbindungsversuche gestartet statt einem (oder den Fehlerzustand verlassen)."),
+        format!(
+            "In {} s nach dem Fehler kam kein weiterer Verbindungsversuch.",
+            observe.as_secs()
+        ),
+        format!(
+            "Die Wallbox hat {further} weitere Verbindungsversuche gestartet (oder den Fehlerzustand verlassen)."
+        ),
     );
+    Some(failure)
 }
 
-/// Counts connection attempts seen on `rx` during `within`, including the one that led to the failure.
+/// Counts connection attempts seen on `rx` during `within`. The caller has already read the events up to the
+/// rejected attempt, so every attempt counted here is a retry.
 async fn count_attempts(
     ctx: &mut ScenarioCtx,
     rx: &mut broadcast::Receiver<BoxEvent>,
@@ -163,23 +190,38 @@ async fn count_attempts(
             Wait::TimedOut | Wait::Aborted => break,
         }
     }
-    // The receiver was created before the connect command, so the attempt that failed is counted too:
-    // anything beyond one is a retry.
     seen
 }
 
+/// Puts the wallbox back the way it was. This happens after the checks are decided, with its own time
+/// allowance (the pause after the 401 can be longer than what is left of the scenario timeout), and a
+/// failure is reported as a separate check that does not decide the verdict of S10.
 async fn restore_connection(ctx: &mut ScenarioCtx, was_connected: bool) {
+    ctx.extend_deadline_for_restore();
     let original = ctx.handle.password().clone();
     if let Err(error) = ctx.handle.set_password(original).await {
-        ctx.fail("Passwort zurücksetzen", error.to_string());
+        ctx.fail(
+            RESTORE_CHECK_NAME,
+            format!("Das Passwort ließ sich nicht zurücksetzen: {error}"),
+        );
         return;
     }
     if let Err(error) = ctx.handle.disconnect().await {
-        ctx.fail("Verbindung zurücksetzen", error.to_string());
+        ctx.fail(
+            RESTORE_CHECK_NAME,
+            format!("Die Verbindung ließ sich nicht trennen: {error}"),
+        );
         return;
     }
     if was_connected {
-        ctx.ensure_connected().await;
+        // After the 401 the wallbox pauses before it connects again; this waits that pause out.
+        match ctx.connect_and_wait().await {
+            Ok(true) | Ok(false) => {}
+            Err(reason) => ctx.fail(
+                RESTORE_CHECK_NAME,
+                format!("Die Wallbox ist nach dem Szenario nicht wieder verbunden: {reason}"),
+            ),
+        }
     }
 }
 

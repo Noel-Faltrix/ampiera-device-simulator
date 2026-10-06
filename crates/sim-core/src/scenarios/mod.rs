@@ -15,7 +15,8 @@ use chrono::Utc;
 pub use app::{AppProbe, AppProbeData};
 pub use ctx::{ScenarioCtx, ScenarioTuning};
 
-use crate::model::{ScenarioId, ScenarioInfo, ScenarioReport};
+use crate::model::{ChargePointConfig, ScenarioId, ScenarioInfo, ScenarioReport, TargetKind};
+use crate::policy;
 
 struct Entry {
     id: ScenarioId,
@@ -30,8 +31,8 @@ const CATALOG: [Entry; 12] = [
     Entry {
         id: ScenarioId::S1,
         title: "Anmelden, Status, Heartbeat",
-        description: "Die Box meldet sich neu an (BootNotification). Geprüft wird, dass die Zentrale mit Accepted und \
-                      Heartbeat-Intervall antwortet, dass die Aufrufe nach dem Start in der richtigen Reihenfolge \
+        description: "Die Wallbox meldet sich neu an (BootNotification). Geprüft wird, dass die Zentrale mit Accepted \
+                      und Heartbeat-Intervall antwortet, dass die Aufrufe nach dem Start in der richtigen Reihenfolge \
                       kommen und dass ein Heartbeat mit currentTime beantwortet wird. Es ist nichts zu tun.",
         live_allowed: true,
         needs_human: false,
@@ -39,7 +40,7 @@ const CATALOG: [Entry; 12] = [
     },
     Entry {
         id: ScenarioId::S2,
-        title: "Auto anstecken und laden",
+        title: "Fahrzeug anstecken und laden",
         description: "Ein Standardfahrzeug wird angesteckt. Geprüft werden Status Preparing, StartTransaction mit \
                       transactionId ab 1, Status Charging und zwei MeterValues mit Leistung größer 0. Das dauert \
                       etwa zwei Messintervalle. Es ist nichts zu tun.",
@@ -50,8 +51,8 @@ const CATALOG: [Entry; 12] = [
     Entry {
         id: ScenarioId::S3,
         title: "Testgrenze aus dem Intranet",
-        description: "Die Box lädt, dann muss im Intranet die „Testgrenze“ für diese Box ausgelöst werden. Geprüft \
-                      wird, dass das Profil höchstens 15 Minuten gültig ist, die Box auf die Grenze (±1 %) regelt \
+        description: "Die Wallbox lädt, dann musst du im Intranet die „Testgrenze“ für diese Wallbox auslösen. Geprüft \
+                      wird, dass das Profil höchstens 15 Minuten gültig ist, die Wallbox auf die Grenze (±1 %) regelt \
                       und nach validTo plus 30 s wieder mit voller Leistung lädt.",
         live_allowed: true,
         needs_human: true,
@@ -59,11 +60,11 @@ const CATALOG: [Entry; 12] = [
     },
     Entry {
         id: ScenarioId::S4,
-        title: "Server weg während einer Grenze",
-        description: "Die Box lädt, dann muss im Intranet eine Testgrenze ausgelöst werden. Nach dem Profil trennt \
-                      die Box die Verbindung und baut sie erst nach validTo plus 30 s wieder auf. Geprüft wird, \
-                      dass die Grenze offline gilt, ohne Zentrale zum Ablaufzeitpunkt endet und die Neuanmeldung \
-                      klappt.",
+        title: "Zentrale weg während einer Grenze",
+        description: "Die Wallbox lädt, dann musst du im Intranet eine Testgrenze auslösen. Nach dem Profil trennt \
+                      die Wallbox die Verbindung und baut sie erst nach validTo plus 30 s wieder auf. Geprüft wird, \
+                      dass die Grenze ohne Verbindung gilt, zum Ablaufzeitpunkt auch ohne Zentrale endet und die \
+                      Neuanmeldung klappt.",
         live_allowed: true,
         needs_human: true,
         timeout_s: 20 * 60,
@@ -71,7 +72,7 @@ const CATALOG: [Entry; 12] = [
     Entry {
         id: ScenarioId::S5,
         title: "StopTransaction mit transactionId 0",
-        description: "Die Box sendet ein StopTransaction mit transactionId 0 (so endet ein Ladevorgang, den die \
+        description: "Die Wallbox sendet ein StopTransaction mit transactionId 0 (so endet ein Ladevorgang, den die \
                       Zentrale nicht gespeichert hat). Geprüft wird, dass die Zentrale mit Accepted antwortet, \
                       keinen Fehler meldet und die Verbindung hält. Es ist nichts zu tun.",
         live_allowed: true,
@@ -80,18 +81,18 @@ const CATALOG: [Entry; 12] = [
     },
     Entry {
         id: ScenarioId::S6,
-        title: "Box lehnt Profil ab",
-        description: "Die Box ist so eingestellt, dass sie Ladeprofile ablehnt. Dann muss im Intranet eine Testgrenze \
-                      ausgelöst werden. Geprüft wird, dass die Box mit Rejected antwortet, die Verbindung bleibt \
-                      und keine Grenze wirkt.",
+        title: "Wallbox lehnt Ladeprofil ab",
+        description: "Die Wallbox ist so eingestellt, dass sie Ladeprofile ablehnt. Dann musst du im Intranet eine \
+                      Testgrenze auslösen. Geprüft wird, dass die Wallbox mit Rejected antwortet, die Verbindung \
+                      bleibt und keine Grenze wirkt.",
         live_allowed: true,
         needs_human: true,
         timeout_s: 20 * 60,
     },
     Entry {
         id: ScenarioId::S6b,
-        title: "Box ohne Ladestand (SoC)",
-        description: "Die Box meldet keinen Ladestand und startet neu. Geprüft wird, dass sie die erste \
+        title: "Wallbox ohne Ladestand (SoC)",
+        description: "Die Wallbox meldet keinen Ladestand und startet neu. Geprüft wird, dass sie die erste \
                       Konfiguration mit SoC mit Rejected beantwortet und die Zentrale danach eine Konfiguration \
                       ohne SoC schickt. Es ist nichts zu tun.",
         live_allowed: true,
@@ -101,16 +102,16 @@ const CATALOG: [Entry; 12] = [
     Entry {
         id: ScenarioId::S7,
         title: "Zweite Verbindung derselben Kennung",
-        description: "Ein zweiter Socket mit derselben Kennung wird geöffnet. Geprüft wird, dass die Zentrale die \
-                      erste Verbindung schließt (Code 1000). Es ist nichts zu tun.",
+        description: "Es wird eine zweite Verbindung mit derselben Kennung geöffnet. Geprüft wird, dass die Zentrale \
+                      die erste Verbindung schließt (Code 1000). Es ist nichts zu tun.",
         live_allowed: true,
         needs_human: false,
         timeout_s: 60,
     },
     Entry {
         id: ScenarioId::S8,
-        title: "Uhr der Box geht falsch",
-        description: "Die Uhr der Box geht 15 Minuten nach, während sie lädt. Geprüft wird, dass die Zentrale die \
+        title: "Uhr der Wallbox geht falsch",
+        description: "Die Uhr der Wallbox geht 15 Minuten nach, während sie lädt. Geprüft wird, dass die Zentrale die \
                       MeterValues trotzdem beantwortet. Dass sie die alten Werte verwirft, ist über OCPP nicht \
                       sichtbar und steht nur als Hinweis im Bericht. Es ist nichts zu tun.",
         live_allowed: true,
@@ -119,10 +120,10 @@ const CATALOG: [Entry; 12] = [
     },
     Entry {
         id: ScenarioId::S9,
-        title: "Fahrplan steuert die Box",
+        title: "Fahrplan steuert die Wallbox",
         description: "Nur lokal. Es muss ein Ladebedarf in der App oder im Intranet geöffnet sein und lokal \
-                      OCPP_AKTIV=aktiv gelten. Die Box lädt und wartet auf ein Profil aus dem Fahrplan (validTo darf \
-                      länger als 15 Minuten sein). Geprüft wird, dass die Grenze wirkt und das Profil bei einer \
+                      OCPP_AKTIV=aktiv gelten. Die Wallbox lädt und wartet auf ein Profil aus dem Fahrplan (validTo \
+                      darf länger als 15 Minuten sein). Geprüft wird, dass die Grenze wirkt und das Profil bei einer \
                       Fahrplanänderung ersetzt oder gelöscht wird.",
         live_allowed: false,
         needs_human: true,
@@ -131,23 +132,25 @@ const CATALOG: [Entry; 12] = [
     Entry {
         id: ScenarioId::S10,
         title: "Falsches Passwort",
-        description: "Nur lokal. Die Box verbindet sich dreimal mit falschem Passwort. Geprüft wird, dass jedes Mal \
-                      HTTP 401 kommt, kein Hinweis auf den falschen Teil und dass die Box nicht automatisch \
+        description: "Nur lokal. Die Wallbox verbindet sich dreimal mit falschem Passwort. Geprüft wird, dass jedes \
+                      Mal HTTP 401 kommt, kein Hinweis auf den falschen Teil und dass die Wallbox nicht automatisch \
                       weiterprobiert. Es ist nichts zu tun.",
         live_allowed: false,
         needs_human: false,
-        timeout_s: 60,
+        timeout_s: 180,
     },
     Entry {
         id: ScenarioId::S11,
         title: "App-Sicht während des Ladens",
-        description: "Die Box lädt mindestens 15 Minuten mit gleichbleibender Leistung, die App-Ansicht wird alle \
-                      30 s abgefragt. Dafür muss in der App-Ansicht angemeldet sein. Geprüft werden Verbindung, \
-                      Gerätestatus, Live-Leistung (±10 %) und Viertelstunden-kWh (±15 %). Fehler bei Live-Leistung \
-                      und Gerätestatus sind ein bekannter Befund der Zentrale, kein Fehler des Simulators.",
+        description: "Die Wallbox lädt von Anfang an mit gleichbleibender Leistung, bis eine volle, an der Uhr \
+                      ausgerichtete Viertelstunde gemessen ist, plus 4 Minuten für den Rechenlauf der Zentrale. Die \
+                      App-Sicht wird alle 30 s abgefragt. Dafür musst du in der App-Sicht angemeldet sein. Geprüft \
+                      werden Verbindung, Gerätestatus, aktuelle Leistung (±10 %) und Viertelstunden-kWh (±15 %). \
+                      Fehler bei aktueller Leistung und Gerätestatus sind ein bekannter Befund der Zentrale, kein \
+                      Fehler des Simulators.",
         live_allowed: true,
         needs_human: true,
-        timeout_s: 25 * 60,
+        timeout_s: 40 * 60,
     },
 ];
 
@@ -174,30 +177,40 @@ pub fn info(id: ScenarioId) -> ScenarioInfo {
         .expect("every ScenarioId has a catalog entry")
 }
 
+/// True when the scenario may run against this box. Decided by the effective target (derived from the URL
+/// host), not by the configured label alone.
+pub fn allowed_on(info: &ScenarioInfo, config: &ChargePointConfig) -> bool {
+    info.live_allowed || policy::effective_kind(config) != TargetKind::Live
+}
+
 /// Runs one scenario and builds its report. The box configuration is restored afterwards, whatever happened.
+/// The caller (`Simulator::run_scenario`) has already checked `allowed_on`.
 pub async fn run(id: ScenarioId, mut ctx: ScenarioCtx) -> ScenarioReport {
     let started_at = Utc::now();
     let snapshot = ctx.handle.snapshot();
     let handle = ctx.handle.clone();
     let original = ctx.original_config.clone();
-    if !ctx.info.live_allowed && snapshot.config.target_kind == crate::model::TargetKind::Live {
-        ctx.fail(
-            "Szenario auf Live-System",
-            "Dieses Szenario darf nicht gegen das Live-System laufen und wurde nicht ausgeführt.",
-        );
-    } else {
-        dispatch(id, &mut ctx).await;
-    }
+    dispatch(id, &mut ctx).await;
     if handle.snapshot().config != original {
         if let Err(error) = handle.set_config(original).await {
             ctx.fail("Einstellungen zurücksetzen", error.to_string());
+        }
+    }
+    if id == ScenarioId::S4 {
+        // Whatever ended the scenario (abort, time-out, failed check), the reconnect block it set must not
+        // outlive it: a connect clears the block and brings the wallbox back online.
+        ctx.extend_deadline_for_restore();
+        if let Err(error) = ctx.connect_box().await {
+            ctx.fail("Verbindung wiederherstellen", error.to_string());
         }
     }
     let (checks, aborted) = ctx.finish();
     ScenarioReport {
         scenario_id: id,
         charge_point_id: snapshot.id,
-        target_kind: snapshot.config.target_kind,
+        charge_point_label: Some(snapshot.config.label.clone()),
+        charge_point_identity: Some(snapshot.config.identity.clone()),
+        target_kind: policy::effective_kind(&snapshot.config),
         started_at,
         finished_at: Utc::now(),
         outcome: rules::outcome_of(&checks, aborted),
@@ -237,8 +250,8 @@ mod tests {
         assert_eq!(flags(ScenarioId::S1), (true, false, 90));
         assert_eq!(flags(ScenarioId::S3), (true, true, 1200));
         assert_eq!(flags(ScenarioId::S9), (false, true, 1800));
-        assert_eq!(flags(ScenarioId::S10), (false, false, 60));
-        assert_eq!(flags(ScenarioId::S11), (true, true, 1500));
+        assert_eq!(flags(ScenarioId::S10), (false, false, 180));
+        assert_eq!(flags(ScenarioId::S11), (true, true, 2400));
         let live_forbidden: Vec<_> = all
             .iter()
             .filter(|i| !i.live_allowed)

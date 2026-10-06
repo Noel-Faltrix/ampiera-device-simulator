@@ -1,21 +1,29 @@
 //! Shared machinery of the scenarios: waiting for frames and state, recording checks, abort handling.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::sync::{broadcast, watch};
 use tokio::time::Instant;
 
 use super::rules::ReceivedCall;
 use super::AppProbe;
+use crate::error::SimError;
 use crate::handle::{BoxEvent, BoxHandle, CallOutcome};
 use crate::model::{
     ChargePointConfig, ChargePointSnapshot, CheckOutcome, CheckResult, ConnectionState,
     FrameDirection, OcppStatus, ScenarioInfo, VehicleConfig,
 };
 use crate::ocpp::frames::{parse_frame, Frame};
+
+/// How long the answer to a call that was already seen is awaited.
+pub const ANSWER_WAIT: Duration = Duration::from_secs(5);
+
+/// Poll step while waiting for an answer that is expected in the frame log.
+const LOG_POLL: Duration = Duration::from_millis(100);
 
 /// Waits and thresholds of the scenarios. The defaults are the values from SCENARIOS.md; tests shorten them.
 #[derive(Debug, Clone)]
@@ -37,11 +45,16 @@ pub struct ScenarioTuning {
     pub post_boot_wait: Duration,
     /// Poll interval of the app view in S11 (CONTRACT: at most every 30 s).
     pub app_poll_interval: Duration,
-    /// Minimum charging time in S11 before the quarter-hour comparison is attempted.
-    pub min_charge_duration: Duration,
+    /// Time the backend's 15-minute job needs after a quarter ended (3 min after the quarter plus margin);
+    /// S11 waits this long before it reads the quarter value.
+    pub backend_job_wait: Duration,
     /// Optional earlier end of S11 than the scenario timeout (used by tests; `None` waits for the
     /// quarter-hour value up to the timeout).
     pub app_max_wait: Option<Duration>,
+    /// Added to a connect cooldown before the scenario tries again.
+    pub cooldown_margin: Duration,
+    /// Replaces the scenario's own timeout (tests); `None` uses the catalog value.
+    pub timeout_override: Option<Duration>,
 }
 
 impl Default for ScenarioTuning {
@@ -55,8 +68,10 @@ impl Default for ScenarioTuning {
             close_wait: Duration::from_secs(10),
             post_boot_wait: Duration::from_secs(20),
             app_poll_interval: Duration::from_secs(30),
-            min_charge_duration: Duration::from_secs(15 * 60),
+            backend_job_wait: Duration::from_secs(4 * 60),
             app_max_wait: None,
+            cooldown_margin: Duration::from_secs(1),
+            timeout_override: None,
         }
     }
 }
@@ -93,6 +108,8 @@ pub struct ScenarioCtx {
     pub probe: Option<Arc<dyn AppProbe>>,
     abort: watch::Receiver<bool>,
     deadline: Instant,
+    /// When the run started; frames logged before are not part of it.
+    pub started_at: DateTime<Utc>,
     checks: Vec<CheckResult>,
     aborted: bool,
     /// Configuration before the scenario changed anything; restored at the end.
@@ -109,7 +126,10 @@ impl ScenarioCtx {
         abort: watch::Receiver<bool>,
     ) -> Self {
         let original_config = handle.snapshot().config;
-        let deadline = Instant::now() + Duration::from_secs(info.timeout_s);
+        let timeout = tuning
+            .timeout_override
+            .unwrap_or_else(|| Duration::from_secs(info.timeout_s));
+        let deadline = Instant::now() + timeout;
         Self {
             handle,
             info,
@@ -117,6 +137,7 @@ impl ScenarioCtx {
             probe,
             abort,
             deadline,
+            started_at: Utc::now(),
             checks: Vec::new(),
             aborted: false,
             original_config,
@@ -186,10 +207,20 @@ impl ScenarioCtx {
 
     // ----- waiting -----
 
-    /// Waits until `limit` has passed. Returns false when aborted.
+    /// Waits until `limit` has passed, but never past the scenario deadline. Returns false when aborted.
     pub async fn sleep(&mut self, limit: Duration) -> bool {
-        let until = Instant::now() + limit;
+        let until = (Instant::now() + limit).min(self.deadline);
         self.sleep_until(until).await
+    }
+
+    /// Gives the scenario time for the work after its checks are decided (restoring the connection): the
+    /// deadline moves out to cover a connect pause plus the time to connect.
+    pub fn extend_deadline_for_restore(&mut self) {
+        let extra = self.handle.timings().cooldown
+            + self.tuning.cooldown_margin
+            + self.tuning.connect_wait
+            + self.handle.timings().connect_timeout;
+        self.deadline = self.deadline.max(Instant::now() + extra);
     }
 
     async fn sleep_until(&mut self, until: Instant) -> bool {
@@ -251,7 +282,15 @@ impl ScenarioCtx {
                             return Wait::Ready(found);
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        // Events were lost, so a "missing frame" verdict could be wrong; say so in the report.
+                        self.fail(
+                            "Ereignisse verpasst",
+                            format!(
+                                "Das Szenario hat {missed} Ereignisse der Wallbox verpasst; das Ergebnis kann unvollständig sein."
+                            ),
+                        );
+                    }
                     Err(broadcast::error::RecvError::Closed) => return Wait::TimedOut,
                 },
                 () = tokio::time::sleep_until(until) => return Wait::TimedOut,
@@ -324,6 +363,27 @@ impl ScenarioCtx {
         .await
     }
 
+    /// Like `wait_answer`, but records a failed check with `missing_detail` on time-out.
+    /// Returns `None` on time-out or abort.
+    pub async fn expect_answer(
+        &mut self,
+        rx: &mut broadcast::Receiver<BoxEvent>,
+        direction: FrameDirection,
+        id: &str,
+        within: Duration,
+        check_name: &str,
+        missing_detail: &str,
+    ) -> Option<SeenFrame> {
+        match self.wait_answer(rx, direction, id, within).await {
+            Wait::Ready(seen) => Some(seen),
+            Wait::TimedOut => {
+                self.fail(check_name, missing_detail);
+                None
+            }
+            Wait::Aborted => None,
+        }
+    }
+
     /// Waits for a snapshot accepted by `pred`.
     pub async fn wait_snapshot(
         &mut self,
@@ -360,15 +420,58 @@ impl ScenarioCtx {
 
     // ----- preparation steps shared by several scenarios -----
 
+    /// True while the box has an open connection.
+    pub fn is_connected(&self) -> bool {
+        matches!(
+            self.handle.snapshot().connection,
+            ConnectionState::Connected { .. }
+        )
+    }
+
+    /// Opens the connection. After a rejected login (HTTP 401/429) the box refuses to connect for a while;
+    /// this waits out that pause once and tries again, because a scenario that needs the connection has no
+    /// better choice.
+    pub async fn connect_box(&mut self) -> Result<(), SimError> {
+        match self.handle.connect().await {
+            Err(SimError::ConnectCooldown { remaining_s }) => {
+                let pause = Duration::from_secs(remaining_s) + self.tuning.cooldown_margin;
+                if !self.sleep(pause).await {
+                    return Err(SimError::ConnectCooldown { remaining_s });
+                }
+                self.handle.connect().await
+            }
+            other => other,
+        }
+    }
+
+    /// Starts a connection, or restarts it when the box is already connected (so the BootNotification and
+    /// the calls after it happen after the caller subscribed).
+    pub async fn connect_or_reboot(&mut self) -> Result<(), SimError> {
+        if self.is_connected() {
+            self.handle.reboot().await
+        } else {
+            self.connect_box().await
+        }
+    }
+
     /// Makes sure the box is connected. Records a failed check (and returns false) when it cannot be.
     pub async fn ensure_connected(&mut self) -> bool {
-        let snapshot = self.handle.snapshot();
-        if matches!(snapshot.connection, ConnectionState::Connected { .. }) {
-            return true;
+        match self.connect_and_wait().await {
+            Ok(connected) => connected,
+            Err(text) => {
+                self.fail("Verbindung zur Zentrale", text);
+                false
+            }
         }
-        if let Err(error) = self.handle.connect().await {
-            self.fail("Verbindung zur Zentrale", error.to_string());
-            return false;
+    }
+
+    /// Connects and waits for the connection. `Ok(false)` means aborted, `Err` carries the German reason.
+    pub async fn connect_and_wait(&mut self) -> Result<bool, String> {
+        if self.is_connected() {
+            return Ok(true);
+        }
+        if let Err(error) = self.connect_box().await {
+            return Err(error.to_string());
         }
         let within = self.tuning.connect_wait;
         let result = self
@@ -381,12 +484,9 @@ impl ScenarioCtx {
             .await;
         match result {
             Wait::Ready(s) => match s.connection {
-                ConnectionState::Connected { .. } => true,
-                ConnectionState::Failed { reason } => {
-                    self.fail("Verbindung zur Zentrale", reason);
-                    false
-                }
-                _ => false,
+                ConnectionState::Connected { .. } => Ok(true),
+                ConnectionState::Failed { reason } => Err(reason),
+                _ => Ok(false),
             },
             Wait::TimedOut => {
                 let last = self
@@ -394,16 +494,12 @@ impl ScenarioCtx {
                     .snapshot()
                     .last_error
                     .unwrap_or_else(|| "keine Fehlermeldung".to_string());
-                self.fail(
-                    "Verbindung zur Zentrale",
-                    format!(
-                        "Die Box wurde innerhalb von {} s nicht verbunden. Letzter Fehler: {last}",
-                        within.as_secs()
-                    ),
-                );
-                false
+                Err(format!(
+                    "Die Wallbox wurde innerhalb von {} s nicht verbunden. Letzter Fehler: {last}",
+                    within.as_secs()
+                ))
             }
-            Wait::Aborted => false,
+            Wait::Aborted => Ok(false),
         }
     }
 
@@ -429,7 +525,7 @@ impl ScenarioCtx {
                 self.fail(
                     "Ladevorgang gestartet",
                     format!(
-                        "Die Box ist nach {} s nicht im Status Charging.",
+                        "Die Wallbox ist nach {} s nicht im Status Charging.",
                         within.as_secs()
                     ),
                 );
@@ -457,13 +553,14 @@ impl ScenarioCtx {
         }
         self.fail(
             &format!("{action} senden"),
-            "Die Box war nicht angemeldet, der Aufruf konnte nicht gesendet werden.",
+            "Die Wallbox war nicht angemeldet, der Aufruf konnte nicht gesendet werden.",
         );
         None
     }
 
-    /// Collects every SetChargingProfile that arrives: waits up to `first` for the first one and up to
-    /// `extra` for each further one. Each is paired with the answer the box gave.
+    /// Collects every SetChargingProfile of this run: those already in the frame log (they can arrive right after
+    /// StartTransaction, before the scenario starts to wait) and those that arrive later. Waits up to `first` for
+    /// the first one and up to `extra` for each further one. Each is paired with the answer the box gave.
     pub async fn collect_profiles(
         &mut self,
         rx: &mut broadcast::Receiver<BoxEvent>,
@@ -471,15 +568,23 @@ impl ScenarioCtx {
         extra: Duration,
     ) -> Vec<ReceivedProfile> {
         let mut found = Vec::new();
-        let mut within = first;
+        let mut seen_ids: HashSet<String> = HashSet::new();
+        for (id, received_at, payload) in self.logged_profile_calls() {
+            let answer = self.logged_answer(&id).await;
+            seen_ids.insert(id);
+            found.push(ReceivedProfile {
+                received_at,
+                payload,
+                answer,
+            });
+        }
+        let mut within = if found.is_empty() { first } else { extra };
         loop {
             let waited = self
-                .wait_frame(
-                    rx,
-                    FrameDirection::In,
-                    within,
-                    |f| matches!(f, Frame::Call { action, .. } if action == "SetChargingProfile"),
-                )
+                .wait_frame(rx, FrameDirection::In, within, |f| {
+                    matches!(f, Frame::Call { id, action, .. }
+                        if action == "SetChargingProfile" && !seen_ids.contains(id))
+                })
                 .await;
             let Wait::Ready(seen) = waited else {
                 return found;
@@ -488,21 +593,60 @@ impl ScenarioCtx {
                 return found;
             };
             let answer = self
-                .wait_answer(rx, FrameDirection::Out, &id, Duration::from_secs(5))
+                .wait_answer(rx, FrameDirection::Out, &id, ANSWER_WAIT)
                 .await;
             let status = match answer {
-                Wait::Ready(SeenFrame {
-                    frame: Frame::CallResult { payload, .. },
-                    ..
-                }) => super::rules::response_status(&payload).map(str::to_string),
+                Wait::Ready(answer) => answer_status(&answer.frame),
                 _ => None,
             };
+            seen_ids.insert(id);
             found.push(ReceivedProfile {
                 received_at: seen.at,
                 payload,
                 answer: status,
             });
             within = extra;
+        }
+    }
+
+    /// SetChargingProfile calls the box received since this run started: (message id, time, payload).
+    fn logged_profile_calls(&self) -> Vec<(String, DateTime<Utc>, Value)> {
+        self.handle
+            .log_entries()
+            .into_iter()
+            .filter(|e| e.direction == FrameDirection::In && e.at >= self.started_at)
+            .filter_map(|e| match parse_frame(&e.raw) {
+                Ok(Frame::Call {
+                    id,
+                    action,
+                    payload,
+                }) if action == "SetChargingProfile" => Some((id, e.at, payload)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The status the box answered to call `id`, read from the frame log (the answer may still be on its way).
+    async fn logged_answer(&mut self, id: &str) -> Option<String> {
+        let until = Instant::now() + ANSWER_WAIT;
+        loop {
+            let found = self.handle.log_entries().into_iter().find_map(|e| {
+                if e.direction != FrameDirection::Out {
+                    return None;
+                }
+                match parse_frame(&e.raw) {
+                    Ok(Frame::CallResult { id: i, payload }) if i == id => {
+                        Some(super::rules::response_status(&payload).map(str::to_string))
+                    }
+                    _ => None,
+                }
+            });
+            if let Some(status) = found {
+                return status;
+            }
+            if Instant::now() >= until || !self.sleep(LOG_POLL).await {
+                return None;
+            }
         }
     }
 }
@@ -539,7 +683,12 @@ pub fn received_call(frame: &Frame) -> Option<ReceivedCall> {
     }
 }
 
-/// An empty payload.
-pub fn empty_payload() -> Value {
-    json!({})
+/// The `status` of a CALLRESULT (`Accepted`, `Rejected`, ...); `None` for anything else.
+pub fn answer_status(frame: &Frame) -> Option<String> {
+    match frame {
+        Frame::CallResult { payload, .. } => {
+            super::rules::response_status(payload).map(str::to_string)
+        }
+        _ => None,
+    }
 }

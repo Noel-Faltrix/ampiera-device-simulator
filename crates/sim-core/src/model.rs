@@ -34,7 +34,7 @@ pub enum RateUnit {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChargePointConfig {
-    /// Label shown in the UI, e.g. "Box 1".
+    /// Label shown in the UI, e.g. "Wallbox 1".
     pub label: String,
     /// Backend the box connects to.
     pub target_kind: TargetKind,
@@ -64,7 +64,7 @@ impl ChargePointConfig {
     /// A three-phase 11 kW box pointing at the local backend; a sensible starting point for the UI.
     pub fn default_local(identity: &str) -> Self {
         Self {
-            label: "Box 1".to_string(),
+            label: "Wallbox 1".to_string(),
             target_kind: TargetKind::Local,
             base_url: DEFAULT_LOCAL_BASE_URL.to_string(),
             identity: identity.to_string(),
@@ -246,6 +246,8 @@ pub struct ChargePointSnapshot {
     pub heartbeat_interval_s: Option<u32>,
     /// Last error worth showing, German.
     pub last_error: Option<String>,
+    /// Time of the last state change of this box ("Stand" in the UI).
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Direction of a logged frame.
@@ -290,19 +292,19 @@ pub enum ScenarioId {
     /// StopTransaction mit transactionId 0.
     #[serde(rename = "S5")]
     S5,
-    /// Box lehnt Profil ab.
+    /// Wallbox lehnt Ladeprofil ab.
     #[serde(rename = "S6")]
     S6,
-    /// Box ohne Ladestand (SoC).
+    /// Wallbox ohne Ladestand (SoC).
     #[serde(rename = "S6b")]
     S6b,
     /// Zweite Verbindung derselben Kennung.
     #[serde(rename = "S7")]
     S7,
-    /// Uhr der Box geht falsch.
+    /// Uhr der Wallbox geht falsch.
     #[serde(rename = "S8")]
     S8,
-    /// Fahrplan steuert die Box.
+    /// Fahrplan steuert die Wallbox.
     #[serde(rename = "S9")]
     S9,
     /// Falsches Passwort.
@@ -375,6 +377,12 @@ pub struct ScenarioReport {
     pub scenario_id: ScenarioId,
     /// Local id of the box.
     pub charge_point_id: String,
+    /// Label of the box for the exported report; absent in reports from older versions.
+    #[serde(default)]
+    pub charge_point_label: Option<String>,
+    /// OCPP identity of the box for the exported report; absent in reports from older versions.
+    #[serde(default)]
+    pub charge_point_identity: Option<String>,
     /// Backend the box was connected to.
     pub target_kind: TargetKind,
     /// Start of the run.

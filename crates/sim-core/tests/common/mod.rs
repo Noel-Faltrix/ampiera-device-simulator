@@ -76,6 +76,8 @@ struct Shared {
     attempts: AtomicUsize,
     next_tx: AtomicI64,
     sequence: AtomicUsize,
+    /// How many StartTransaction calls are still answered with a rejection.
+    reject_starts: AtomicUsize,
 }
 
 /// A running mock central system.
@@ -107,6 +109,7 @@ impl Mock {
             attempts: AtomicUsize::new(0),
             next_tx: AtomicI64::new(1),
             sequence: AtomicUsize::new(0),
+            reject_starts: AtomicUsize::new(0),
         });
         let accept_shared = shared.clone();
         tokio::spawn(async move {
@@ -115,6 +118,11 @@ impl Mock {
             }
         });
         Self { addr, shared }
+    }
+
+    /// The next `count` StartTransaction calls are answered with idTagInfo `Invalid`.
+    pub fn reject_next_starts(&self, count: usize) {
+        self.shared.reject_starts.store(count, Ordering::SeqCst);
     }
 
     pub fn base_url(&self) -> String {
@@ -502,6 +510,13 @@ fn answer_call(
         "MeterValues" => Ok(json!({})),
         "Authorize" => Ok(json!({"idTagInfo": {"status": "Accepted"}})),
         "StartTransaction" => {
+            let rejecting = shared
+                .reject_starts
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if rejecting {
+                return Ok(json!({"transactionId": 0, "idTagInfo": {"status": "Invalid"}}));
+            }
             let id = shared.next_tx.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"transactionId": id, "idTagInfo": {"status": "Accepted"}}))
         }
@@ -543,6 +558,12 @@ pub fn fast_settings() -> sim_core::Settings {
     settings.timings.tick = Duration::from_millis(100);
     settings.timings.backoff_base = Duration::from_millis(200);
     settings.timings.connect_timeout = Duration::from_secs(5);
+    // The mock sends 1 s intervals; the production floor of 5 s would stretch every test.
+    settings.timings.min_interval = Duration::from_secs(1);
+    settings.timings.cooldown = Duration::from_millis(600);
+    settings.timings.stable_after = Duration::from_secs(1);
+    settings.timings.start_retry = Duration::from_secs(1);
+    settings.tuning.cooldown_margin = Duration::from_millis(100);
     settings.tuning.after_valid_to = Duration::from_secs(2);
     settings.tuning.limit_settle = Duration::from_millis(800);
     settings.tuning.second_profile_wait = Duration::from_secs(2);

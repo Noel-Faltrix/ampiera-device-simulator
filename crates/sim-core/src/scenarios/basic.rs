@@ -6,19 +6,43 @@ use chrono::Utc;
 use serde_json::json;
 use tokio::sync::broadcast;
 
+use super::ctx::answer_status;
 use super::ctx::{default_vehicle_for, received_call, ScenarioCtx, Wait};
 use super::rules::{
     check_post_boot_sequence, clock_offset_matches, meter_timestamp, response_status,
     sampled_value, ReceivedCall,
 };
 use crate::handle::{BoxEvent, CallOutcome};
-use crate::model::{ConnectionState, FrameDirection, OcppStatus};
+use crate::model::{FrameDirection, OcppStatus};
 use crate::ocpp::client;
 use crate::ocpp::frames::Frame;
 use crate::ocpp::messages::{format_timestamp, MEASURAND_POWER};
 
-/// How long the box gets to answer the boot handshake.
+/// How long the wallbox gets to answer the boot handshake.
 const BOOT_WAIT: Duration = Duration::from_secs(60);
+
+/// Time for one step of the charging start (status change, StartTransaction with its answer): a few
+/// round trips plus the simulation tick.
+const STEP_WAIT: Duration = Duration::from_secs(60);
+
+/// Time to the first MeterValues after charging started: the default sample interval of 60 s plus margin.
+const METER_WAIT: Duration = Duration::from_secs(150);
+
+/// Time for the central system to answer a call: the 30 s call timeout plus margin.
+const ANSWER_WAIT: Duration = Duration::from_secs(35);
+
+/// Time the wallbox needs to become available again after unplugging.
+const UNPLUG_WAIT: Duration = Duration::from_secs(15);
+
+/// How long the connection is watched after the answer in S5; a central system that dislikes the call closes
+/// the socket within moments.
+const KEEP_ALIVE_WATCH: Duration = Duration::from_secs(2);
+
+/// Time for the wallbox's own answer to a call it received (it answers within a tick).
+const OWN_ANSWER_WAIT: Duration = Duration::from_secs(10);
+
+/// Time for the central system to resend the configuration without SoC after the rejection.
+const CONFIG_RETRY_WAIT: Duration = Duration::from_secs(30);
 
 /// Clock error S8 simulates: 15 minutes slow, the case the backend's 10 minute window discards.
 const S8_CLOCK_OFFSET_S: i64 = -15 * 60;
@@ -40,17 +64,8 @@ fn call_payload(frame: Frame) -> Option<(String, serde_json::Value)> {
 /// S1: connect, BootNotification, post-boot calls, Heartbeat.
 pub async fn s1_boot(ctx: &mut ScenarioCtx) {
     let mut rx = ctx.handle.subscribe();
-    let was_connected = matches!(
-        ctx.handle.snapshot().connection,
-        ConnectionState::Connected { .. }
-    );
     // Already connected: reboot, otherwise the BootNotification and the calls after it happened before we listened.
-    let started = if was_connected {
-        ctx.handle.reboot().await
-    } else {
-        ctx.handle.connect().await
-    };
-    if let Err(error) = started {
+    if let Err(error) = ctx.connect_or_reboot().await {
         ctx.fail("Verbindung zur Zentrale", error.to_string());
         return;
     }
@@ -61,7 +76,7 @@ pub async fn s1_boot(ctx: &mut ScenarioCtx) {
             BOOT_WAIT,
             is_call("BootNotification"),
             "BootNotification beantwortet",
-            "Die Box hat kein BootNotification gesendet; die Verbindung kam nicht zustande.",
+            "Die Wallbox hat kein BootNotification gesendet; die Verbindung kam nicht zustande.",
         )
         .await
     else {
@@ -71,11 +86,11 @@ pub async fn s1_boot(ctx: &mut ScenarioCtx) {
         return;
     };
     let Some(answer) = ctx
-        .expect_frame(
+        .expect_answer(
             &mut rx,
             FrameDirection::In,
+            &boot_id,
             BOOT_WAIT,
-            |f| matches!(f, Frame::CallResult { id, .. } | Frame::CallError { id, .. } if *id == boot_id),
             "BootNotification beantwortet",
             "Die Zentrale hat das BootNotification nicht beantwortet.",
         )
@@ -173,7 +188,7 @@ async fn check_heartbeat(ctx: &mut ScenarioCtx) {
             ctx.fail(NAME, format!("CALLERROR {code}: {description}"));
         }
         Some(CallOutcome::Timeout) => {
-            ctx.fail(NAME, "Keine Antwort auf den Heartbeat innerhalb von 30 s.")
+            ctx.fail(NAME, "Keine Antwort auf den Heartbeat innerhalb von 30 s.");
         }
         Some(CallOutcome::NotConnected) | None => {}
     }
@@ -193,7 +208,7 @@ pub async fn s2_plug_in_and_charge(ctx: &mut ScenarioCtx) {
         ctx.fail("Fahrzeug anstecken", error.to_string());
         return;
     }
-    let step = Duration::from_secs(60);
+    let step = STEP_WAIT;
     if expect_status(ctx, &mut rx, "Preparing", step)
         .await
         .is_none()
@@ -232,16 +247,14 @@ async fn unplug_first(ctx: &mut ScenarioCtx) -> bool {
         return false;
     }
     match ctx
-        .wait_snapshot(Duration::from_secs(15), |s| {
-            s.status == OcppStatus::Available
-        })
+        .wait_snapshot(UNPLUG_WAIT, |s| s.status == OcppStatus::Available)
         .await
     {
         Wait::Ready(_) => true,
         Wait::TimedOut => {
             ctx.fail(
                 "Fahrzeug abstecken",
-                "Die Box wurde nach dem Abstecken nicht wieder frei (Available).",
+                "Die Wallbox wurde nach dem Abstecken nicht wieder frei (Available).",
             );
             false
         }
@@ -265,7 +278,7 @@ async fn expect_status(
                 if action == "StatusNotification" && payload.get("status").and_then(serde_json::Value::as_str) == Some(status))
         },
         &name,
-        &format!("Die Box hat nicht innerhalb von {} s den Status {status} gemeldet.", within.as_secs()),
+        &format!("Die Wallbox hat nicht innerhalb von {} s den Status {status} gemeldet.", within.as_secs()),
     )
     .await?;
     ctx.pass(&name, "Status gemeldet.");
@@ -285,16 +298,16 @@ async fn expect_transaction(
             within,
             is_call("StartTransaction"),
             NAME,
-            "Die Box hat kein StartTransaction gesendet.",
+            "Die Wallbox hat kein StartTransaction gesendet.",
         )
         .await?;
     let (id, _) = call_payload(start.frame)?;
     let answer = ctx
-        .expect_frame(
+        .expect_answer(
             rx,
             FrameDirection::In,
+            &id,
             within,
-            |f| matches!(f, Frame::CallResult { id: i, .. } | Frame::CallError { id: i, .. } if *i == id),
             NAME,
             "Die Zentrale hat StartTransaction nicht beantwortet.",
         )
@@ -339,19 +352,19 @@ async fn expect_meter_values(
         .expect_frame(
             rx,
             FrameDirection::Out,
-            Duration::from_secs(150),
+            METER_WAIT,
             is_call("MeterValues"),
             &name,
-            "Die Box hat kein MeterValues gesendet (Messintervall prüfen).",
+            "Die Wallbox hat kein MeterValues gesendet. Prüfe das Messintervall.",
         )
         .await?;
     let (id, payload) = call_payload(call.frame)?;
     let answer = ctx
-        .expect_frame(
+        .expect_answer(
             rx,
             FrameDirection::In,
-            Duration::from_secs(35),
-            |f| matches!(f, Frame::CallResult { id: i, .. } | Frame::CallError { id: i, .. } if *i == id),
+            &id,
+            ANSWER_WAIT,
             &name,
             "Die Zentrale hat MeterValues nicht beantwortet.",
         )
@@ -414,40 +427,30 @@ pub async fn s5_stop_transaction_zero(ctx: &mut ScenarioCtx) {
         CallOutcome::Timeout => ctx.fail(NAME, "Keine Antwort innerhalb von 30 s."),
         CallOutcome::NotConnected => ctx.fail(NAME, "Die Verbindung brach vor der Antwort ab."),
     }
-    if !ctx.sleep(Duration::from_secs(2)).await {
+    if !ctx.sleep(KEEP_ALIVE_WATCH).await {
         return;
     }
-    let connected = matches!(
-        ctx.handle.snapshot().connection,
-        ConnectionState::Connected { .. }
-    );
     ctx.check(
-        connected,
+        ctx.is_connected(),
         "Verbindung bleibt bestehen",
-        "Die Verbindung war auch zwei Sekunden nach der Antwort noch offen.",
+        format!(
+            "Die Verbindung war auch {} s nach der Antwort noch offen.",
+            KEEP_ALIVE_WATCH.as_secs()
+        ),
         "Die Zentrale hat die Verbindung nach dem StopTransaction beendet.",
     );
 }
 
-/// S6b: a box without SoC rejects the first ChangeConfiguration and receives one without SoC.
+/// S6b: a wallbox without SoC rejects the first ChangeConfiguration and receives one without SoC.
 pub async fn s6b_no_soc(ctx: &mut ScenarioCtx) {
     let mut config = ctx.handle.snapshot().config;
     config.supports_soc = false;
     if let Err(error) = ctx.handle.set_config(config).await {
-        ctx.fail("Box ohne SoC einstellen", error.to_string());
+        ctx.fail("Wallbox ohne SoC einstellen", error.to_string());
         return;
     }
     let mut rx = ctx.handle.subscribe();
-    let was_connected = matches!(
-        ctx.handle.snapshot().connection,
-        ConnectionState::Connected { .. }
-    );
-    let started = if was_connected {
-        ctx.handle.reboot().await
-    } else {
-        ctx.handle.connect().await
-    };
-    if let Err(error) = started {
+    if let Err(error) = ctx.connect_or_reboot().await {
         ctx.fail("Verbindung zur Zentrale", error.to_string());
         return;
     }
@@ -485,28 +488,25 @@ pub async fn s6b_no_soc(ctx: &mut ScenarioCtx) {
         return;
     };
     let Some(answer) = ctx
-        .expect_frame(
+        .expect_answer(
             &mut rx,
             FrameDirection::Out,
-            Duration::from_secs(10),
-            |f| matches!(f, Frame::CallResult { id, .. } if *id == first_id),
+            &first_id,
+            OWN_ANSWER_WAIT,
             first_name,
-            "Die Box hat die Konfiguration nicht beantwortet.",
+            "Die Wallbox hat die Konfiguration nicht beantwortet.",
         )
         .await
     else {
         return;
     };
-    let status = match &answer.frame {
-        Frame::CallResult { payload, .. } => response_status(payload).map(str::to_string),
-        _ => None,
-    };
+    let status = answer_status(&answer.frame);
     ctx.check(
         status.as_deref() == Some("Rejected"),
         first_name,
-        "Die Box antwortete mit Rejected.",
+        "Die Wallbox antwortete mit Rejected.",
         format!(
-            "Die Box antwortete mit {} statt Rejected.",
+            "Die Wallbox antwortete mit {} statt Rejected.",
             status.unwrap_or_default()
         ),
     );
@@ -514,7 +514,7 @@ pub async fn s6b_no_soc(ctx: &mut ScenarioCtx) {
         .wait_frame(
             &mut rx,
             FrameDirection::In,
-            Duration::from_secs(30),
+            CONFIG_RETRY_WAIT,
             sampled(false),
         )
         .await;
@@ -525,25 +525,37 @@ pub async fn s6b_no_soc(ctx: &mut ScenarioCtx) {
         ),
         Wait::TimedOut => ctx.fail(
             "Zweite Konfiguration ohne SoC kommt an",
-            "Nach der Ablehnung kam innerhalb von 30 s keine Konfiguration ohne SoC.",
+            format!(
+                "Nach der Ablehnung kam innerhalb von {} s keine Konfiguration ohne SoC.",
+                CONFIG_RETRY_WAIT.as_secs()
+            ),
         ),
         Wait::Aborted => {}
     }
 }
 
-/// S7: a second socket with the same identity makes the server close the first one.
+/// S7: a second connection with the same identity makes the central system close the first one.
+///
+/// The second connection is opened directly and bypasses the connect gate, so on a live box the scenario is
+/// refused (German check) while the live limit of three connected boxes is used up.
 pub async fn s7_second_connection(ctx: &mut ScenarioCtx) {
     const NAME: &str = "Erste Verbindung wird geschlossen";
     if !ctx.ensure_connected().await {
         return;
     }
     // A completed round trip proves the central system has registered the first session; opening the second
-    // socket earlier could race with that registration and make the replacement invisible.
+    // connection earlier could race with that registration and make the replacement invisible.
     if !matches!(
         ctx.call("Heartbeat", json!({})).await,
         Some(CallOutcome::Result(_))
     ) {
         ctx.fail(NAME, "Die erste Verbindung antwortet nicht auf einen Heartbeat; der Test ist nicht aussagekräftig.");
+        return;
+    }
+    // The second connection bypasses the connect gate, so the live limit is checked here: with three live
+    // boxes connected it would be a fourth live connection.
+    if let Err(error) = ctx.handle.check_extra_connection() {
+        ctx.fail("Zweite Verbindung öffnen", error.to_string());
         return;
     }
     let snapshot = ctx.handle.snapshot();
@@ -552,7 +564,7 @@ pub async fn s7_second_connection(ctx: &mut ScenarioCtx) {
         &snapshot.config.base_url,
         &snapshot.config.identity,
         ctx.handle.password(),
-        Duration::from_secs(15),
+        ctx.handle.timings().connect_timeout,
     )
     .await;
     let second_socket = match second {
@@ -602,10 +614,10 @@ pub async fn s8_wrong_clock(ctx: &mut ScenarioCtx) {
         .expect_frame(
             &mut rx,
             FrameDirection::Out,
-            Duration::from_secs(150),
+            METER_WAIT,
             is_call("MeterValues"),
             NAME,
-            "Die Box hat kein MeterValues gesendet (Messintervall prüfen).",
+            "Die Wallbox hat kein MeterValues gesendet. Prüfe das Messintervall.",
         )
         .await
     else {
@@ -618,7 +630,7 @@ pub async fn s8_wrong_clock(ctx: &mut ScenarioCtx) {
     match meter_timestamp(&payload) {
         Some(ts) => ctx.check(
             clock_offset_matches(ts, seen_at, S8_CLOCK_OFFSET_S, S8_TIMESTAMP_TOLERANCE_S),
-            "Zeitstempel der Box geht 15 Minuten nach",
+            "Zeitstempel der Wallbox geht 15 Minuten nach",
             format!(
                 "Zeitstempel {} liegt 15 Minuten vor der echten Zeit.",
                 format_timestamp(ts)
@@ -629,16 +641,16 @@ pub async fn s8_wrong_clock(ctx: &mut ScenarioCtx) {
             ),
         ),
         None => ctx.fail(
-            "Zeitstempel der Box geht 15 Minuten nach",
+            "Zeitstempel der Wallbox geht 15 Minuten nach",
             "Das MeterValues enthält keinen lesbaren Zeitstempel.",
         ),
     }
     let Some(answer) = ctx
-        .expect_frame(
+        .expect_answer(
             &mut rx,
             FrameDirection::In,
-            Duration::from_secs(35),
-            |f| matches!(f, Frame::CallResult { id: i, .. } | Frame::CallError { id: i, .. } if *i == id),
+            &id,
+            ANSWER_WAIT,
             NAME,
             "Die Zentrale hat das MeterValues nicht beantwortet.",
         )

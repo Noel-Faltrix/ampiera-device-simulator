@@ -151,6 +151,8 @@ async fn scenario_s8_wrong_clock_is_answered() {
 async fn scenario_s10_wrong_password_locally() {
     let h = Harness::new().await;
     let id = h.add_box().await;
+    h.connect_and_wait(&id).await;
+    let before = h.mock.attempts();
     let report = h.sim.run_scenario(&id, ScenarioId::S10).await.unwrap();
     assert_passed(&report);
     assert_eq!(
@@ -162,10 +164,27 @@ async fn scenario_s10_wrong_password_locally() {
         CheckOutcome::Passed
     );
     assert_eq!(
-        h.mock.attempts(),
+        h.mock.attempts() - before,
         4,
-        "three direct attempts plus one by the box"
+        "exactly three attempts with the wrong password (two direct, one by the wallbox) plus the reconnect \
+         that restores the connection"
     );
+    // The box had been connected before: after the pause that follows the 401 it is back.
+    let sim = h.sim.clone();
+    wait_until_async("Wallbox wieder verbunden", WAIT, || {
+        let sim = sim.clone();
+        let id = id.clone();
+        async move {
+            sim.list().await.iter().any(|s| {
+                s.id == id
+                    && matches!(
+                        s.connection,
+                        sim_core::model::ConnectionState::Connected { .. }
+                    )
+            })
+        }
+    })
+    .await;
 }
 
 /// Sends a test limit once the box charges, like a person pressing "Testgrenze" in the intranet.
@@ -196,17 +215,92 @@ async fn scenario_s3_test_limit_regulates_and_ends() {
     let report = h.sim.run_scenario(&id, ScenarioId::S3).await.unwrap();
     assert_passed(&report);
     assert_eq!(
-        outcome_of(&report, "Box regelt auf die Grenze"),
+        outcome_of(&report, "Wallbox regelt auf die Grenze"),
         CheckOutcome::Passed
     );
     assert_eq!(
-        outcome_of(&report, "Nach validTo lädt die Box mit voller Leistung"),
+        outcome_of(&report, "Nach validTo lädt die Wallbox mit voller Leistung"),
         CheckOutcome::Passed
     );
     assert_eq!(
         outcome_of(&report, "Gültigkeit höchstens 15 Minuten"),
         CheckOutcome::Passed
     );
+}
+
+#[tokio::test]
+async fn scenario_s3_sees_a_profile_that_arrives_right_after_start_transaction() {
+    let h = Harness::new().await;
+    let id = h.add_box().await;
+    let mock = h.mock.clone();
+    tokio::spawn(async move {
+        // No pause: the profile follows StartTransaction while the scenario is still waiting for "Charging".
+        wait_until("StartTransaction", WAIT, || {
+            mock.count("StartTransaction") >= 1
+        })
+        .await;
+        let valid_to = Utc::now() + chrono::Duration::seconds(5);
+        mock.send_test_limit(IDENTITY, 4000.0, valid_to, Some(1))
+            .await;
+    });
+    let report = h.sim.run_scenario(&id, ScenarioId::S3).await.unwrap();
+    assert_passed(&report);
+    assert_eq!(
+        outcome_of(&report, "Profil empfangen"),
+        CheckOutcome::Passed
+    );
+    assert_eq!(
+        outcome_of(&report, "Wallbox regelt auf die Grenze"),
+        CheckOutcome::Passed
+    );
+}
+
+#[tokio::test]
+async fn aborting_s4_while_the_box_is_blocked_brings_it_back_online() {
+    let mock = Mock::start().await;
+    let mut settings = fast_settings();
+    // A block far longer than the test: only the cleanup after the scenario can end it.
+    settings.tuning.after_valid_to = Duration::from_secs(120);
+    let sim = Simulator::with_settings(Arc::new(RecordingSink::default()), settings);
+    let id = sim
+        .add(local_config(&mock), PASSWORD.into(), false)
+        .await
+        .unwrap();
+    let valid_to = Utc::now() + chrono::Duration::seconds(5);
+    let sender = mock.clone();
+    tokio::spawn(async move {
+        wait_until("Ladevorgang", WAIT, || sender.count("MeterValues") >= 1).await;
+        sender
+            .send_test_limit(IDENTITY, 4000.0, valid_to, Some(1))
+            .await;
+    });
+    let run_sim = sim.clone();
+    let run_id = id.clone();
+    let run = tokio::spawn(async move { run_sim.run_scenario(&run_id, ScenarioId::S4).await });
+    let probe = sim.clone();
+    let probe_id = id.clone();
+    wait_until_async("Wallbox getrennt und gesperrt", WAIT, || {
+        let sim = probe.clone();
+        let id = probe_id.clone();
+        async move {
+            sim.list().await.iter().any(|s| {
+                s.id == id
+                    && matches!(
+                        s.connection,
+                        sim_core::model::ConnectionState::Reconnecting { .. }
+                    )
+            })
+        }
+    })
+    .await;
+    sim.abort_scenario(&id).await.unwrap();
+    let report = run.await.unwrap().unwrap();
+    assert_eq!(report.outcome, ReportOutcome::Aborted);
+    let m = mock.clone();
+    wait_until("Wallbox wieder verbunden", WAIT, || {
+        m.is_connected(IDENTITY)
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -266,7 +360,7 @@ async fn scenario_s6_box_rejects_profiles() {
     let report = h.sim.run_scenario(&id, ScenarioId::S6).await.unwrap();
     assert_passed(&report);
     assert_eq!(
-        outcome_of(&report, "Box antwortet mit Rejected"),
+        outcome_of(&report, "Wallbox antwortet mit Rejected"),
         CheckOutcome::Passed
     );
     assert_eq!(
@@ -346,7 +440,6 @@ async fn scenario_s11_reports_the_known_app_gaps_as_failures() {
     let mock = Mock::start().await;
     let mut settings = fast_settings();
     settings.tuning.app_poll_interval = Duration::from_millis(300);
-    settings.tuning.min_charge_duration = Duration::from_secs(1);
     settings.tuning.app_max_wait = Some(Duration::from_secs(2));
     let sim = Simulator::with_settings(Arc::new(RecordingSink::default()), settings);
     // What the gap of 06.10.2026 looks like: connection online, but no live power, wallbox offline, no quarter value.
@@ -371,7 +464,7 @@ async fn scenario_s11_reports_the_known_app_gaps_as_failures() {
         CheckOutcome::Failed
     );
     assert_eq!(
-        outcome_of(&report, "Live-Leistung in der App"),
+        outcome_of(&report, "Aktuelle Leistung in der App"),
         CheckOutcome::Failed
     );
     assert_eq!(
@@ -385,7 +478,6 @@ async fn scenario_s11_passes_live_power_when_the_app_matches_the_box() {
     let mock = Mock::start().await;
     let mut settings = fast_settings();
     settings.tuning.app_poll_interval = Duration::from_millis(300);
-    settings.tuning.min_charge_duration = Duration::from_secs(1);
     settings.tuning.app_max_wait = Some(Duration::from_secs(2));
     let sim = Simulator::with_settings(Arc::new(RecordingSink::default()), settings);
     sim.set_app_probe(Arc::new(FakeApp(sim_core::AppProbeData {
@@ -400,7 +492,7 @@ async fn scenario_s11_passes_live_power_when_the_app_matches_the_box() {
         .unwrap();
     let report = sim.run_scenario(&id, ScenarioId::S11).await.unwrap();
     assert_eq!(
-        outcome_of(&report, "Live-Leistung in der App"),
+        outcome_of(&report, "Aktuelle Leistung in der App"),
         CheckOutcome::Passed,
         "within 10 % of 11000 W"
     );

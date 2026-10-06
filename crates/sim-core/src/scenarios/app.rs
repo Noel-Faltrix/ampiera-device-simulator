@@ -20,6 +20,11 @@ pub const QUARTER_ENERGY_TOLERANCE_PCT: f64 = 15.0;
 /// Length of one energy interval in the backend (`resolution = quarter hour`).
 const QUARTER_MINUTES: i64 = 15;
 
+/// Appended to every statement about the quarter-hour value: the labelling convention is an assumption.
+const LABEL_ASSUMPTION: &str =
+    "Annahme: Die App beschriftet eine Viertelstunde mit ihrem Beginn. Das lässt sich \
+                                aus dem Code der Zentrale nicht prüfen.";
+
 /// The device status the backend shows for a wallbox it cannot reach.
 const STATUS_OFFLINE: &str = "offline";
 
@@ -51,7 +56,7 @@ pub trait AppProbe: Send + Sync {
     async fn snapshot(&self) -> Result<AppProbeData, String>;
 }
 
-/// Box meter reading at a point in time.
+/// Wallbox meter reading at a point in time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnergySample {
     /// When it was read.
@@ -121,22 +126,22 @@ fn within_pct(app: f64, reference: f64, tolerance_pct: f64) -> bool {
     ((app - reference) / reference).abs() * 100.0 <= tolerance_pct
 }
 
-/// Live power of the app against the box power (±10 %). A missing box value skips the check; a missing app
-/// value fails it, because that is exactly the gap this scenario looks for.
+/// Current power of the app against the wallbox power (±10 %). A missing wallbox value skips the check; a
+/// missing app value fails it, because that is exactly the gap this scenario looks for.
 pub fn check_live_power(app_w: Option<f64>, box_w: Option<f64>) -> CheckResult {
-    const NAME: &str = "Live-Leistung in der App";
+    const NAME: &str = "Aktuelle Leistung in der App";
     let Some(box_w) = box_w else {
         return result(
             NAME,
             CheckOutcome::Skipped,
-            "Die Box meldet gerade keine Leistung, ein Vergleich ist nicht möglich.".into(),
+            "Die Wallbox meldet gerade keine Leistung, ein Vergleich ist nicht möglich.".into(),
         );
     };
     let Some(app_w) = app_w else {
         return result(
             NAME,
             CheckOutcome::Failed,
-            format!("Die App liefert keine Live-Leistung (null), die Box lädt mit {box_w:.0} W."),
+            format!("Die App liefert keine aktuelle Leistung (null), die Wallbox lädt mit {box_w:.0} W."),
         );
     };
     let ok = within_pct(app_w, box_w, LIVE_POWER_TOLERANCE_PCT);
@@ -148,7 +153,7 @@ pub fn check_live_power(app_w: Option<f64>, box_w: Option<f64>) -> CheckResult {
     result(
         NAME,
         outcome,
-        format!("App {app_w:.0} W, Box {box_w:.0} W (erlaubt ±{LIVE_POWER_TOLERANCE_PCT} %)."),
+        format!("App {app_w:.0} W, Wallbox {box_w:.0} W (erlaubt ±{LIVE_POWER_TOLERANCE_PCT} %)."),
     )
 }
 
@@ -159,7 +164,7 @@ pub fn check_quarter_energy(app_kwh: Option<f64>, box_kwh: f64) -> CheckResult {
         return result(
             NAME,
             CheckOutcome::Failed,
-            format!("Die App liefert keinen Viertelstundenwert (null), die Box hat {box_kwh:.3} kWh gemessen."),
+            format!("Die App liefert keinen Viertelstundenwert (null), die Wallbox hat {box_kwh:.3} kWh gemessen."),
         );
     };
     let ok = within_pct(app_kwh, box_kwh, QUARTER_ENERGY_TOLERANCE_PCT);
@@ -171,14 +176,34 @@ pub fn check_quarter_energy(app_kwh: Option<f64>, box_kwh: f64) -> CheckResult {
     result(
         NAME,
         outcome,
-        format!("App {app_kwh:.3} kWh, Box {box_kwh:.3} kWh (erlaubt ±{QUARTER_ENERGY_TOLERANCE_PCT} %)."),
+        format!("App {app_kwh:.3} kWh, Wallbox {box_kwh:.3} kWh (erlaubt ±{QUARTER_ENERGY_TOLERANCE_PCT} %)."),
     )
 }
 
-/// The quarter hour that starts at `at`. The backend labels a quarter with its start time (assumption taken
-/// from the interval start convention of `geraete_messwerte`); if that proves wrong, only this function changes.
+/// The quarter hour that starts at `at`. This is the single place of the convention "the label of a quarter is
+/// its START" (assumed from the interval start convention of `geraete_messwerte`; it cannot be verified from the
+/// backend code). If it proves wrong, only this function changes.
 pub fn quarter_window(at: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
     (at, at + ChronoDuration::minutes(QUARTER_MINUTES))
+}
+
+/// The first clock-aligned quarter hour that starts at or after `at`.
+pub fn next_quarter_start(at: DateTime<Utc>) -> DateTime<Utc> {
+    let quarter_s = QUARTER_MINUTES * 60;
+    let ts = at.timestamp();
+    let aligned = (ts + quarter_s - 1).div_euclid(quarter_s) * quarter_s;
+    DateTime::from_timestamp(aligned, 0).unwrap_or(at)
+}
+
+/// When the app's quarter value can be judged: the first full quarter after `charge_start` has ended and the
+/// backend's job has had `backend_job_wait` to compute it. Returns that quarter's start and the time.
+pub fn quarter_ready_at(
+    charge_start: DateTime<Utc>,
+    backend_job_wait: Duration,
+) -> (DateTime<Utc>, DateTime<Utc>) {
+    let start = next_quarter_start(charge_start);
+    let wait = ChronoDuration::from_std(backend_job_wait).unwrap_or_default();
+    (start, quarter_window(start).1 + wait)
 }
 
 fn interpolate(samples: &[EnergySample], at: DateTime<Utc>) -> Option<f64> {
@@ -227,8 +252,15 @@ pub fn power_is_constant(samples: &[EnergySample], from: DateTime<Utc>, to: Date
         .all(|p| within_pct(*p, mean, CONSTANT_POWER_TOLERANCE_PCT))
 }
 
-/// Decides the quarter-hour check from the latest app value and the box samples.
+/// Decides the quarter-hour check from the latest app value and the wallbox samples. Every detail states the
+/// labelling assumption (see [`quarter_window`]).
 pub fn judge_quarter(data: &AppProbeData, samples: &[EnergySample]) -> CheckResult {
+    let mut checked = judge_quarter_inner(data, samples);
+    checked.detail = format!("{} {LABEL_ASSUMPTION}", checked.detail);
+    checked
+}
+
+fn judge_quarter_inner(data: &AppProbeData, samples: &[EnergySample]) -> CheckResult {
     const NAME: &str = "Viertelstunden-kWh in der App";
     let Some(at) = data.last_quarter_at else {
         return result(
@@ -243,7 +275,7 @@ pub fn judge_quarter(data: &AppProbeData, samples: &[EnergySample]) -> CheckResu
             NAME,
             CheckOutcome::Skipped,
             format!(
-                "Die App zeigt die Viertelstunde ab {}, aber die Box hat das Fenster nicht vollständig gemessen \
+                "Die App zeigt die Viertelstunde ab {}, aber die Wallbox hat das Fenster nicht vollständig gemessen \
                  (Ladebeginn oder Abruf lagen dazwischen); ein Vergleich wäre verfälscht.",
                 at.format("%H:%M")
             ),
@@ -259,25 +291,23 @@ pub fn judge_quarter(data: &AppProbeData, samples: &[EnergySample]) -> CheckResu
     check_quarter_energy(data.last_quarter_kwh, box_kwh)
 }
 
-/// True when the app's quarter value can be judged against the samples collected so far.
-fn quarter_is_decidable(data: &AppProbeData, samples: &[EnergySample]) -> bool {
-    data.last_quarter_at.is_some_and(|at| {
-        energy_in_window(samples, quarter_window(at).0, quarter_window(at).1).is_some()
-    })
-}
+/// The checks S11 cannot run without an app login.
+const S11_CHECK_NAMES: [&str; 4] = [
+    "Verbindung in der App",
+    "Gerätestatus in der App",
+    "Aktuelle Leistung in der App",
+    "Viertelstunden-kWh in der App",
+];
 
-/// S11: charge at constant power and poll the app view.
+/// S11: charge at constant power from the start and poll the app view until one full clock-aligned quarter hour
+/// is measured and the backend's job has run.
 pub async fn s11_app_view(ctx: &mut ScenarioCtx) {
     let Some(probe) = ctx.probe.clone() else {
-        for name in [
-            "Verbindung in der App",
-            "Gerätestatus in der App",
-            "Live-Leistung in der App",
-            "Viertelstunden-kWh in der App",
-        ] {
+        for name in S11_CHECK_NAMES {
             ctx.skip(
                 name,
-                "Die App-Ansicht ist nicht angemeldet. Bitte zuerst in der App-Ansicht anmelden, dann das Szenario neu starten.",
+                "Die App-Sicht ist nicht angemeldet. Melde dich zuerst in der App-Sicht an und starte das \
+                 Szenario dann neu.",
             );
         }
         return;
@@ -285,6 +315,8 @@ pub async fn s11_app_view(ctx: &mut ScenarioCtx) {
     if !ctx.ensure_connected().await || !ctx.ensure_charging().await {
         return;
     }
+    let charge_start = Utc::now();
+    let (quarter_start, ready_at) = quarter_ready_at(charge_start, ctx.tuning.backend_job_wait);
     let started = tokio::time::Instant::now();
     let mut samples: Vec<EnergySample> = Vec::new();
     let mut latest: Option<(AppProbeData, Option<f64>)> = None;
@@ -300,16 +332,12 @@ pub async fn s11_app_view(ctx: &mut ScenarioCtx) {
             Ok(data) => latest = Some((data, box_snapshot.power_w)),
             Err(message) => last_error = Some(message),
         }
-        let long_enough = started.elapsed() >= ctx.tuning.min_charge_duration;
-        let decided = latest
-            .as_ref()
-            .is_some_and(|(data, _)| quarter_is_decidable(data, &samples));
         let out_of_time = ctx.remaining() <= ctx.tuning.app_poll_interval
             || ctx
                 .tuning
                 .app_max_wait
                 .is_some_and(|max| started.elapsed() >= max);
-        if (long_enough && decided) || out_of_time {
+        if Utc::now() >= ready_at || out_of_time {
             break;
         }
         let interval: Duration = ctx.tuning.app_poll_interval;
@@ -319,9 +347,9 @@ pub async fn s11_app_view(ctx: &mut ScenarioCtx) {
     }
     let Some((data, box_power)) = latest else {
         ctx.fail(
-            "App-Ansicht abrufen",
+            "App-Sicht abrufen",
             format!(
-                "Die App-Ansicht konnte nie abgerufen werden: {}",
+                "Die App-Sicht konnte nie abgerufen werden: {}",
                 last_error.unwrap_or_else(|| "keine Fehlermeldung".to_string())
             ),
         );
@@ -330,7 +358,15 @@ pub async fn s11_app_view(ctx: &mut ScenarioCtx) {
     ctx.push_result(check_connection(data.connection.as_deref()));
     ctx.push_result(check_device_status(data.device_status.as_deref()));
     ctx.push_result(check_live_power(data.live_power_w, box_power));
-    ctx.push_result(judge_quarter(&data, &samples));
+    let mut quarter = judge_quarter(&data, &samples);
+    if data.last_quarter_at.is_some_and(|at| at != quarter_start) {
+        quarter.detail = format!(
+            "Gewartet wurde auf die Viertelstunde ab {}. {}",
+            quarter_start.format("%H:%M"),
+            quarter.detail
+        );
+    }
+    ctx.push_result(quarter);
 }
 
 #[cfg(test)]
@@ -517,13 +553,54 @@ mod tests {
             judge_quarter(&uncovered, &samples).outcome,
             CheckOutcome::Skipped
         );
-        assert!(!quarter_is_decidable(&uncovered, &samples));
-        assert!(quarter_is_decidable(&ok, &samples));
     }
 
     #[test]
     fn quarter_window_is_fifteen_minutes() {
         let (from, to) = quarter_window(t(15));
         assert_eq!(to - from, ChronoDuration::minutes(15));
+    }
+
+    #[test]
+    fn quarter_details_state_the_labelling_assumption() {
+        let samples = constant_samples(0, 40);
+        let ok = AppProbeData {
+            last_quarter_kwh: Some(1.75),
+            last_quarter_at: Some(t(15)),
+            ..Default::default()
+        };
+        assert!(judge_quarter(&ok, &samples)
+            .detail
+            .contains("beschriftet eine Viertelstunde mit ihrem Beginn"));
+        let none = AppProbeData::default();
+        assert!(judge_quarter(&none, &samples).detail.contains("Annahme"));
+    }
+
+    #[test]
+    fn next_quarter_start_is_clock_aligned_and_never_earlier() {
+        assert_eq!(next_quarter_start(t(0)), t(0), "already aligned");
+        assert_eq!(next_quarter_start(t(1)), t(15));
+        assert_eq!(
+            next_quarter_start(t(14) + ChronoDuration::seconds(59)),
+            t(15)
+        );
+        assert_eq!(
+            next_quarter_start(t(15) + ChronoDuration::seconds(1)),
+            t(30)
+        );
+    }
+
+    #[test]
+    fn ready_time_is_one_full_quarter_plus_the_backend_job() {
+        let start = t(7);
+        let (quarter, ready) = quarter_ready_at(start, Duration::from_secs(240));
+        assert_eq!(quarter, t(15));
+        assert_eq!(ready, t(30) + ChronoDuration::minutes(4));
+        let worst_case =
+            quarter_ready_at(t(0) + ChronoDuration::seconds(1), Duration::from_secs(240));
+        assert!(
+            worst_case.1 - (t(0) + ChronoDuration::seconds(1)) < ChronoDuration::minutes(40),
+            "counter-check: even the worst alignment fits into the 40 minute scenario timeout"
+        );
     }
 }

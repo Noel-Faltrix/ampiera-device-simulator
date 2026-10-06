@@ -9,6 +9,7 @@ use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::error::SimError;
+use crate::gate::ConnectGate;
 use crate::model::{ChargePointConfig, ChargePointSnapshot, FrameLogEntry, VehicleConfig};
 use crate::ocpp::client::Secret;
 
@@ -35,6 +36,20 @@ pub struct Timings {
     pub backoff_max: Duration,
     /// Time allowed for the TCP/TLS/websocket handshake.
     pub connect_timeout: Duration,
+    /// A connection must have been up this long after an accepted BootNotification before the backoff
+    /// counter resets; otherwise a central system that accepts and immediately closes would be hit once a second.
+    pub stable_after: Duration,
+    /// Pause before connecting again after HTTP 401 or 429 (protects the central system's failure counter).
+    pub cooldown: Duration,
+    /// Pause before a failed StartTransaction is tried again.
+    pub start_retry: Duration,
+    /// Shortest accepted heartbeat and MeterValues interval; the central system must not be able to make the
+    /// box send every second.
+    pub min_interval: Duration,
+    /// Window in which lost connections are counted for flap detection.
+    pub flap_window: Duration,
+    /// More lost connections than this within the window put the box into `failed`.
+    pub flap_max_losses: usize,
 }
 
 impl Default for Timings {
@@ -46,6 +61,12 @@ impl Default for Timings {
             backoff_base: Duration::from_secs(1),
             backoff_max: Duration::from_secs(60),
             connect_timeout: Duration::from_secs(15),
+            stable_after: Duration::from_secs(60),
+            cooldown: Duration::from_secs(60),
+            start_retry: Duration::from_secs(30),
+            min_interval: Duration::from_secs(5),
+            flap_window: Duration::from_secs(300),
+            flap_max_losses: 5,
         }
     }
 }
@@ -113,15 +134,22 @@ pub enum Command {
 pub enum BoxEvent {
     /// A frame went out or came in.
     Frame(FrameLogEntry),
-    /// The central system closed the socket.
+    /// The connection ended (closed by the central system or lost).
     Closed {
-        /// WebSocket close code, if one was sent.
+        /// WebSocket close code; `None` when the connection dropped without a close frame.
         code: Option<u16>,
         /// Close reason text.
         reason: String,
     },
     /// A connection attempt started.
     ConnectAttempt,
+    /// A connection attempt failed.
+    ConnectFailed {
+        /// HTTP status of the handshake response, if there was one.
+        http_status: Option<u16>,
+        /// Start of the response body, if there was one.
+        body: Option<String>,
+    },
 }
 
 /// Cheap-to-clone handle to one box.
@@ -134,6 +162,8 @@ pub struct BoxHandle {
     pub(crate) snapshot: watch::Receiver<ChargePointSnapshot>,
     pub(crate) log: Arc<Mutex<VecDeque<FrameLogEntry>>>,
     pub(crate) password: Secret,
+    pub(crate) gate: Arc<ConnectGate>,
+    pub(crate) timings: Timings,
 }
 
 impl BoxHandle {
@@ -152,7 +182,12 @@ impl BoxHandle {
         self.events.subscribe()
     }
 
-    /// The password the box was created with (needed by scenarios that open a second socket).
+    /// The time constants this box runs with (scenarios use the connect timeout for their own connections).
+    pub fn timings(&self) -> &Timings {
+        &self.timings
+    }
+
+    /// The password the box was created with (needed by scenarios that open a second connection).
     pub fn password(&self) -> &Secret {
         &self.password
     }
@@ -174,9 +209,17 @@ impl BoxHandle {
         rx.await.map_err(|_| SimError::BoxStopped)?
     }
 
-    /// Opens the connection.
+    /// Opens the connection. Towards the Produktivserver this takes one of the three allowed slots; the slot is
+    /// reserved before the command is sent, so parallel connects cannot exceed the limit.
     pub async fn connect(&self) -> Result<(), SimError> {
+        let _slot = self.gate.reserve(&self.id)?;
         self.request(Command::Connect).await
+    }
+
+    /// Whether this box may open one more connection next to its own (a live box may not when the limit of
+    /// live connections is used up). Scenarios that open their own socket must ask first.
+    pub fn check_extra_connection(&self) -> Result<(), SimError> {
+        self.gate.check_extra_connection(&self.id)
     }
 
     /// Closes the connection.
