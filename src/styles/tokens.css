@@ -1,0 +1,290 @@
+/*
+ * Design-Tokens des Ampiera Support-Leitstands.
+ *
+ * SEIT 15.09.2026 AUF DER MARKENPALETTE. Vorher lief das Dashboard auf dem
+ * Teal des ersten Konzept-Mockups (dashboard.html) — eine Farbe, die mit
+ * dem Ampiera-Logo nichts zu tun hat. Jetzt gelten dieselben Werte wie auf
+ * der Webseite: Markengruen #3b6f2a als dominante Farbe, das dunklere
+ * #2a5a1f fuer Hover/Aktiv, #2e7d0b fuer Links und Fokus.
+ *
+ * DREI ZUSTAENDE, unveraendert: helles Grundschema, automatischer Dark-Mode
+ * ueber prefers-color-scheme, und ein ausdruecklicher Umschalter ueber
+ * [data-theme] (noch kein UI-Schalter, die Tokens sind aber vorbereitet).
+ * Die Markenpalette gibt es nur in hell — die dunklen Werte sind daraus
+ * abgeleitet: dieselben Farbtoene, aufgehellt bis sie auf dunklem Grund
+ * lesbar sind, und die neutralen Graustufen leicht ins Gruene gezogen,
+ * damit sie zur Marke passen statt zum alten Teal.
+ *
+ * ERFOLG IST ABSICHTLICH TEAL, NICHT GRUEN (#0F766E). Die Begruendung
+ * stammt aus der Markenpalette und wiegt im Dashboard schwerer als auf der
+ * Webseite: Wenn die Markenfarbe gruen ist und "in Ordnung" ebenfalls,
+ * liest sich jede gruene Flaeche als Statusmeldung — oder umgekehrt jede
+ * Statusmeldung als Dekoration. Im Leitstand, wo jemand auf einen Blick
+ * sehen muss, welche Anlage Aerger macht, ist das keine Geschmacksfrage.
+ *
+ * KONTRAST: Alle Textfarben sind gegen ihre Hintergruende nachgerechnet und
+ * erreichen mindestens 4,5:1 (WCAG AA). Drei Werte der alten Palette taten
+ * das NICHT — text-muted (3,49), warning (3,63) und good (3,35) auf Weiss.
+ * Sie sind bei dieser Gelegenheit nachgezogen worden; das ist eine
+ * Korrektur, keine Geschmacksaenderung.
+ */
+
+:root {
+  color-scheme: light;
+  /* Eckenradien (29.09.2026) — bisher fest im Code; --radius-md war schon in
+     global.css benutzt, aber nirgends definiert. */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  /* Hoehe der klebenden Kopfzeile (Block 3a, 05.10.2026). Seiten mit eigener
+     Bildschirmhoehe oder klebenden Spalten rechnen sie ab. */
+  --kopf-hoehe: 56px;
+  --bg: #f4f7f3;
+  --surface: #ffffff;
+  --surface-2: #e6ece4;
+  --surface-hover: #dde5da;
+  --border: #d5ded3;
+  --border-strong: #b9c6b6;
+  --text-primary: #16241a;
+  --text-secondary: #4b5f4e;
+  /* NACHGEZOGEN 05.10.2026: #5f6f61 erreichte auf --surface-hover nur 4,14:1
+     und auf --surface-2 4,45:1, also unter AA. Mit #5a695c (gleicher Farbton,
+     etwas dunkler) liegt der Text auf allen Flaechen bei mindestens 4,5:1.
+     Vorher (#7c8c90) lag er bei 3,49 auf Weiss. */
+  --text-muted: #5a695c;
+  --accent: #3b6f2a;
+  --accent-strong: #2a5a1f;
+  --accent-wash: #e7f0e2;
+  /* Das helle Logo-Gruen. NUR fuer Flaechen, Balken und Icons — nie fuer
+     Schrift auf Weiss, dort reicht der Kontrast nicht (2,7:1). */
+  --accent-hell: #3ba100;
+  --navy: #1f3b57;
+  /* Schrift, die AUF einer gesaettigten Flaeche sitzt (Primaerknopf,
+     Gefahrenknopf, aktiver Chip, Zaehler-Badge). Im hellen Schema sind
+     diese Flaechen dunkel, also weiss darauf. Im dunklen Schema sind sie
+     hell — dort wird daraus nahezu Schwarz. Ohne dieses Token stand hier
+     ueberall fest #fff, und im Dark Mode ergab das 2,3:1 auf dem
+     Primaerknopf: lesbar nur, wenn man weiss, was dort steht. */
+  --auf-farbe: #ffffff;
+  /* Teal statt Gruen, siehe Kopfkommentar. */
+  --good: #0f766e;
+  --warning: #8a5a00;
+  --serious: #a8441d;
+  --critical: #b3261e;
+  --good-wash: #ddefec;
+  --warning-wash: #fbf0dd;
+  --serious-wash: #fbe8de;
+  --critical-wash: #f7e0de;
+  --shadow: 0 1px 2px rgba(22, 36, 26, 0.06), 0 4px 16px rgba(22, 36, 26, 0.06);
+  /* Code-Blöcke im Wiki: dunkel in beiden Schemata (Block 3a). Text 13,7:1 bzw. 16,5:1, gedämpft 7,8:1 bzw. 8,0:1. */
+  --code-bg: #16241a;
+  --code-text: #e6efe3;
+  --code-muted: #a9b8a7;
+  --code-linie: rgba(255, 255, 255, 0.08);
+  --code-linie-stark: rgba(255, 255, 255, 0.28);
+
+  /* Hintergrundstruktur (06.09.2026): ein feines Punktraster und ein sehr
+     weicher Farbschimmer auf der freien Flaeche zwischen den Panels. Bewusst
+     unbewegt und knapp ueber der Wahrnehmungsschwelle — es soll die Leere
+     nehmen, nicht auffallen. Panels und Sidebar haben eigene, deckende
+     Hintergruende, der Text sitzt also nie auf der Struktur; am Kontrast
+     aendert sich nichts. */
+  --bg-punkt: rgba(22, 36, 26, 0.06);
+  --bg-schimmer: rgba(59, 111, 42, 0.05);
+
+  /* Ampiera-Brain-Notiztypen (AP Core) — bug/feature/offener-punkt/
+     entscheidung leihen sich bewusst die bestehenden Status-/Akzentfarben
+     (semantisch passend: Bug=kritisch, Feature=gut, offener Punkt=Achtung,
+     Entscheidung=Markenfarbe), die übrigen bekommen eigene Farbtöne.
+
+     NACHGEZOGEN 19.09.2026 (Umbau auf den Obsidian-Vault): "person" und
+     "produkt-konzept" gibt es als Typ nicht mehr — ihre beiden Farbwerte
+     sind an "kapitel" und "anleitung" weitergegeben, statt die Palette um
+     zwei weitere Töne wachsen zu lassen. Neu dazu: "plan", "uebersicht" und
+     "skill". Skill hatte NIE ein Token, obwohl der Typ in der Aufzählung
+     stand — der Punkt im Graphen fiel damit still auf Grau zurück.
+
+     Der Farbkreis ist bei vierzehn Typen eng: "plan" und "skill" sind
+     deshalb über Helligkeit und Sättigung von ihren Nachbarn (architektur
+     bzw. roadmap-stufe) abgesetzt, nicht nur über den Farbton.
+     "uebersicht" teilt sich den Ton mit "kapitel" — beides sind
+     Navigationsnotizen des Buches, und eine Unterscheidung, die niemand
+     braucht, kostet nur einen weiteren Ton. */
+  --type-kapitel: #ae642e;
+  --type-uebersicht: var(--type-kapitel);
+  --type-repo: #2f5bc4;
+  --type-architektur: #7b5fc7;
+  --type-datenmodell: #2f97ad;
+  --type-konvention: #708a3d;
+  --type-entscheidung: var(--accent);
+  --type-bug: var(--critical);
+  --type-feature: var(--good);
+  --type-offener-punkt: var(--warning);
+  --type-anleitung: #b04fa0;
+  --type-plan: #8a5ea8;
+  --type-roadmap-stufe: #6b6ea3;
+  --type-skill: #5d6b78;
+
+  /* Zeilenfarben der Zeitkonto-Monatstabelle (Plan-Block 3d, 05.10.2026):
+     eine zarte Hinterlegung je Tagesart, gelb = Feiertag, orange =
+     Wochenende, blau = Berufsschule, gruen = Urlaub, rot = Krankheit,
+     violett = Freizeitausgleich, tuerkis = Auswaertstaetigkeit, rosa =
+     Sonderurlaub, oliv = Elternzeit. Jede Farbe ist so gewaehlt, dass
+     Haupttext, gedaempfter Text sowie die Saldo-Farben --good und --critical
+     darauf mindestens 4,6:1 erreichen (nachgerechnet, hell und dunkel).
+     Fehltage sind blass rot, ohne Legendeneintrag. */
+  --zk-wochenende: #f9e9d7;
+  --zk-feiertag: #f7ecc6;
+  --zk-schule: #e2edfa;
+  --zk-urlaub: #ddf1e7;
+  --zk-krank: #f8e8e8;
+  --zk-auswaerts: #daf0f3;
+  --zk-sonderurlaub: #f9e7f0;
+  --zk-elternzeit: #ebedda;
+  --zk-freizeitausgleich: #efe9f9;
+  --zk-fehltag: #f8e8e8;
+
+  /* Typografie-Skala (professional-ui-design-standards: feste Skala statt
+     Zufallsgrößen) */
+  --font-sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --text-xs: 11.5px;
+  --text-sm: 12.5px;
+  --text-base: 14px;
+  --text-md: 16px;
+  --text-lg: 20px;
+  --text-xl: 26px;
+
+  /* 8-Punkt-Spacing-Grid */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+}
+
+/* Die dunklen Werte stehen absichtlich zweimal: einmal fuer die
+   System-Einstellung, einmal fuer einen spaeteren ausdruecklichen
+   Umschalter. Wer hier etwas aendert, aendert es an BEIDEN Stellen — sonst
+   sieht das Dashboard je nach Weg unterschiedlich aus. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #0f1411;
+    --surface: #171e18;
+    --surface-2: #1d261e;
+    --surface-hover: #243024;
+    --border: #2c3a2d;
+    --border-strong: #3d4c3e;
+    --text-primary: #edf3ec;
+    --text-secondary: #b0bdaf;
+    --text-muted: #8b9a8c;
+    --accent: #6fbf4a;
+    --accent-strong: #83cc63;
+    --accent-wash: #1b2e16;
+    --accent-hell: #7ed13f;
+    --navy: #7c97ae;
+    --auf-farbe: #0f1411;
+    --good: #45bfb0;
+    --warning: #fab219;
+    --serious: #ec835a;
+    --critical: #e8645a;
+    --good-wash: #13302c;
+    --warning-wash: #332608;
+    --serious-wash: #33190d;
+    --critical-wash: #35171a;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.35);
+    --code-bg: #0a0e0b;
+    --code-text: #e6efe3;
+    --code-muted: #9aab98;
+    --bg-punkt: rgba(255, 255, 255, 0.05);
+    --bg-schimmer: rgba(111, 191, 74, 0.05);
+
+    --zk-wochenende: #27271a;
+    --zk-feiertag: #232719;
+    --zk-schule: #1b282d;
+    --zk-urlaub: #19291f;
+    --zk-krank: #33221d;
+    --zk-auswaerts: #182925;
+    --zk-sonderurlaub: #2f2327;
+    --zk-elternzeit: #202819;
+    --zk-freizeitausgleich: #252533;
+    --zk-fehltag: #33221d;
+
+    --type-kapitel: #e0955f;
+    --type-uebersicht: var(--type-kapitel);
+    --type-repo: #6d9eeb;
+    --type-architektur: #9b87e0;
+    --type-datenmodell: #52c2d9;
+    --type-konvention: #9bc25c;
+    --type-entscheidung: var(--accent);
+    --type-bug: var(--critical);
+    --type-feature: var(--good);
+    --type-offener-punkt: var(--warning);
+    --type-anleitung: #d47fc9;
+    --type-plan: #c49ad8;
+    --type-roadmap-stufe: #b0b0e0;
+    --type-skill: #9fb0bd;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0f1411;
+  --surface: #171e18;
+  --surface-2: #1d261e;
+  --surface-hover: #243024;
+  --border: #2c3a2d;
+  --border-strong: #3d4c3e;
+  --text-primary: #edf3ec;
+  --text-secondary: #b0bdaf;
+  --text-muted: #8b9a8c;
+  --accent: #6fbf4a;
+  --accent-strong: #83cc63;
+  --accent-wash: #1b2e16;
+  --accent-hell: #7ed13f;
+  --navy: #7c97ae;
+  --auf-farbe: #0f1411;
+  --good: #45bfb0;
+  --warning: #fab219;
+  --serious: #ec835a;
+  --critical: #e8645a;
+  --good-wash: #13302c;
+  --warning-wash: #332608;
+  --serious-wash: #33190d;
+  --critical-wash: #35171a;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.35);
+  --code-bg: #0a0e0b;
+  --code-text: #e6efe3;
+  --code-muted: #9aab98;
+  --bg-punkt: rgba(255, 255, 255, 0.05);
+  --bg-schimmer: rgba(111, 191, 74, 0.05);
+
+  --zk-wochenende: #27271a;
+  --zk-feiertag: #232719;
+  --zk-schule: #1b282d;
+  --zk-urlaub: #19291f;
+  --zk-krank: #33221d;
+  --zk-auswaerts: #182925;
+  --zk-sonderurlaub: #2f2327;
+  --zk-elternzeit: #202819;
+  --zk-freizeitausgleich: #252533;
+  --zk-fehltag: #33221d;
+
+  --type-kapitel: #e0955f;
+  --type-uebersicht: var(--type-kapitel);
+  --type-repo: #6d9eeb;
+  --type-architektur: #9b87e0;
+  --type-datenmodell: #52c2d9;
+  --type-konvention: #9bc25c;
+  --type-entscheidung: var(--accent);
+  --type-bug: var(--critical);
+  --type-feature: var(--good);
+  --type-offener-punkt: var(--warning);
+  --type-anleitung: #d47fc9;
+  --type-plan: #c49ad8;
+  --type-roadmap-stufe: #b0b0e0;
+  --type-skill: #9fb0bd;
+}

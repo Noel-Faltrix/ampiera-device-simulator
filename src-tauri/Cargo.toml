@@ -1,0 +1,28 @@
+[package]
+name = "ampiera-device-simulator"
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+description = "Ampiera Device Simulator: simulated OCPP wallboxes for Mac and Windows"
+
+[lib]
+name = "ampiera_device_simulator_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs"] }
+# `v1` selects the native store per platform: macOS Keychain, Windows Credential Manager and, for
+# development builds on Linux, the Secret Service. No other store is linked.
+keyring = { version = "4", default-features = false, features = ["v1"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+sim-core = { path = "../crates/sim-core" }
+app-view = { path = "../crates/app-view" }
