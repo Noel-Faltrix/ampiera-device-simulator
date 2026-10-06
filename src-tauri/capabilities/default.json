@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Minimal permissions of the main window: core events and read-only window access.",
+  "description": "The UI only listens to core events; app commands need no permission.",
   "windows": ["main"],
-  "permissions": ["core:default", "core:event:default", "core:window:default"]
+  "permissions": ["core:event:default"]
 }

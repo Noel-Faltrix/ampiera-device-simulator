@@ -1,11 +1,13 @@
 //! Tauri commands (CONTRACT section 2). Every error is a German text without secrets.
 
+use crate::save::{safe_part, write_unique};
 use crate::state::AppState;
 use app_view::AppLoginResult;
+use chrono::Local;
 use sim_core::model::{
     ChargePointConfig, ChargePointSnapshot, ScenarioId, ScenarioInfo, ScenarioReport, VehicleConfig,
 };
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 fn text(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -16,7 +18,9 @@ fn text(e: impl std::fmt::Display) -> String {
 pub async fn list_charge_points(
     state: State<'_, AppState>,
 ) -> Result<Vec<ChargePointSnapshot>, String> {
-    Ok(state.sim.list().await)
+    let list = state.sim.list().await;
+    state.deliver_problems();
+    Ok(list)
 }
 
 /// Creates a box; the password goes to the keychain only.
@@ -102,6 +106,61 @@ pub async fn export_log(state: State<'_, AppState>, id: String) -> Result<String
 #[tauri::command]
 pub fn export_report(report: ScenarioReport) -> String {
     sim_core::report_to_markdown(&report)
+}
+
+/// Local time stamp for file names.
+fn stamp() -> String {
+    Local::now().format("%Y%m%d-%H%M%S").to_string()
+}
+
+fn downloads(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    app.path()
+        .download_dir()
+        .map_err(|_| "Der Downloads-Ordner ist nicht verfügbar.".to_owned())
+}
+
+/// Identity of a wallbox for file names; falls back to the start of the local id.
+async fn identity_of(state: &AppState, id: &str) -> String {
+    let list = state.sim.list().await;
+    match list.iter().find(|s| s.id == id) {
+        Some(s) => safe_part(&s.config.identity),
+        None => safe_part(&id.chars().take(8).collect::<String>()),
+    }
+}
+
+/// Saves the frame log of a wallbox as JSON in the Downloads folder and returns the path.
+#[tauri::command]
+pub async fn save_log(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<String, String> {
+    let json = state.sim.export_log(&id).await.map_err(text)?;
+    let stem = format!(
+        "ampiera-sim-protokoll-{}-{}",
+        identity_of(&state, &id).await,
+        stamp()
+    );
+    let path = write_unique(&downloads(&app)?, &stem, "json", json.as_bytes()).await?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Saves a scenario report as Markdown in the Downloads folder and returns the path.
+#[tauri::command]
+pub async fn save_report(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    report: ScenarioReport,
+) -> Result<String, String> {
+    let scenario = serde_json::to_value(report.scenario_id)
+        .ok()
+        .and_then(|v| v.as_str().map(safe_part))
+        .unwrap_or_else(|| "szenario".to_owned());
+    let identity = identity_of(&state, &report.charge_point_id).await;
+    let stem = format!("ampiera-sim-bericht-{scenario}-{identity}-{}", stamp());
+    let markdown = sim_core::report_to_markdown(&report);
+    let path = write_unique(&downloads(&app)?, &stem, "md", markdown.as_bytes()).await?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Redeems an invite of the customer app and sets the first password.

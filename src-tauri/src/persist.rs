@@ -11,15 +11,18 @@ const FILE_VERSION: u32 = 1;
 // The backend accepts 8 to 200 characters.
 const DEVICE_ID_LEN: std::ops::RangeInclusive<usize> = 8..=200;
 
-/// One saved box. `store_id` is the keychain account; it equals the local id of the session in
+/// One saved wallbox. `store_id` is the keychain account; it equals the local id of the session in
 /// which the box was created, because the core assigns a new local id on every start.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoredBox {
     /// Keychain account of the OCPP password.
     pub store_id: String,
-    /// Box configuration without secrets.
+    /// Wallbox configuration without secrets.
     pub config: ChargePointConfig,
+    /// Whether the user confirmed live use when creating it; needed again to restore a live box.
+    #[serde(default)]
+    pub live_confirmed: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -28,7 +31,7 @@ struct BoxFile {
     boxes: Vec<StoredBox>,
 }
 
-/// Saved boxes, kept in memory and mirrored to `boxes.json` on every change.
+/// Saved wallboxes, kept in memory and mirrored to `boxes.json` on every change.
 pub struct BoxStore {
     path: PathBuf,
     boxes: Mutex<Vec<StoredBox>>,
@@ -47,7 +50,7 @@ impl BoxStore {
                     let backup = dir.join(format!("{BOXES_FILE}.defekt"));
                     let moved = tokio::fs::rename(&path, &backup).await.is_ok();
                     warning = Some(format!(
-                        "Die gespeicherte Box-Liste ist unlesbar oder stammt von einer anderen Programmversion; sie wurde {}.",
+                        "Die gespeicherte Wallbox-Liste ist unlesbar oder stammt von einer anderen Programmversion; sie wurde {}.",
                         if moved { "als boxes.json.defekt gesichert" } else { "nicht gesichert (Umbenennen fehlgeschlagen)" }
                     ));
                     Vec::new()
@@ -56,7 +59,7 @@ impl BoxStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => {
                 warning = Some(format!(
-                    "Die gespeicherte Box-Liste konnte nicht gelesen werden ({}).",
+                    "Die gespeicherte Wallbox-Liste konnte nicht gelesen werden ({}).",
                     e.kind()
                 ));
                 Vec::new()
@@ -103,7 +106,7 @@ impl BoxStore {
     async fn write(&self, boxes: &[StoredBox]) -> Result<(), String> {
         let failed = |e: std::io::Error| {
             format!(
-                "Die Box-Liste konnte nicht gespeichert werden ({}).",
+                "Die Wallbox-Liste konnte nicht gespeichert werden ({}).",
                 e.kind()
             )
         };
@@ -112,7 +115,7 @@ impl BoxStore {
             boxes: boxes.to_vec(),
         };
         let bytes = serde_json::to_vec_pretty(&file).map_err(|_| {
-            "Die Box-Liste konnte nicht gespeichert werden (Serialisierung).".to_owned()
+            "Die Wallbox-Liste konnte nicht gespeichert werden (Serialisierung).".to_owned()
         })?;
         let tmp = self.path.with_extension("json.tmp");
         tokio::fs::write(&tmp, bytes).await.map_err(failed)?;
@@ -156,6 +159,7 @@ mod tests {
         StoredBox {
             store_id: store_id.to_owned(),
             config,
+            live_confirmed: false,
         }
     }
 

@@ -6,6 +6,7 @@ mod events;
 mod keychain;
 mod persist;
 mod probe;
+mod save;
 mod state;
 
 use state::AppState;
@@ -19,12 +20,8 @@ pub fn run() {
                 "Der Konfigurationsordner des Betriebssystems ist nicht verfügbar.".to_owned()
             })?;
             let handle = app.handle().clone();
-            let (state, mut warnings) =
-                tauri::async_runtime::block_on(AppState::init(handle, &config_dir))?;
-            warnings.extend(tauri::async_runtime::block_on(state.restore_boxes()));
-            for warning in warnings {
-                eprintln!("Hinweis beim Start: {warning}");
-            }
+            let state = tauri::async_runtime::block_on(AppState::init(handle, &config_dir))?;
+            tauri::async_runtime::block_on(state.restore_boxes());
             app.manage(state);
             Ok(())
         })
@@ -42,6 +39,8 @@ pub fn run() {
             commands::abort_scenario,
             commands::export_log,
             commands::export_report,
+            commands::save_log,
+            commands::save_report,
             commands::app_redeem_invite,
             commands::app_login,
             commands::app_verify_device,

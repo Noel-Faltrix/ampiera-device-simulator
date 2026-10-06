@@ -16,6 +16,10 @@ use tokio::time::Instant;
 const DEVICE_NAME: &str = "Ampiera Device Simulator";
 const API: [&str; 3] = ["api", "app", "v1"];
 const DEVICE_ID_CHARS: std::ops::RangeInclusive<usize> = 8..=200;
+/// No answer of the customer API is larger than this; anything bigger is a fault or an attack.
+const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+/// Largest body that is copied into `raw` for display.
+const MAX_RAW_BYTES: usize = 256 * 1024;
 
 /// Timing parameters. The defaults are the production values; tests shorten them.
 #[derive(Debug, Clone, Copy)]
@@ -44,18 +48,25 @@ struct Tokens {
     refresh_at: Instant,
 }
 
+/// A login that waits for the e-mailed device code. Kept apart from the active session so a failed
+/// re-login never destroys a working one.
+struct Pending {
+    base_url: Url,
+    device_id: String,
+    mfa_token: String,
+}
+
 #[derive(Default)]
 struct Session {
     base_url: Option<Url>,
-    device_id: Option<String>,
     tokens: Option<Tokens>,
-    pending_mfa: Option<String>,
+    pending: Option<Pending>,
 }
 
 struct CachedSnapshot {
     generation: u64,
     fetched: Instant,
-    snapshot: AppViewSnapshot,
+    result: Result<AppViewSnapshot, AppError>,
 }
 
 struct Reply {
@@ -66,6 +77,21 @@ struct Reply {
 impl Reply {
     fn ok(&self) -> bool {
         (200..300).contains(&self.status)
+    }
+}
+
+/// Why no reply could be read.
+enum Failure {
+    Transport(reqwest::Error),
+    TooLarge,
+}
+
+impl Failure {
+    fn app(&self) -> AppError {
+        match self {
+            Failure::Transport(e) => network_error(e),
+            Failure::TooLarge => AppError::ResponseTooLarge,
+        }
     }
 }
 
@@ -87,12 +113,21 @@ impl Default for AppClient {
 
 impl AppClient {
     /// Client with production timing.
+    ///
+    /// # Panics
+    /// If the TLS stack cannot be initialised. A client without certificate validation is never
+    /// substituted. The shell uses [`AppClient::try_new`] to report this instead.
     pub fn new() -> Self {
+        Self::try_new().expect("TLS-Initialisierung des HTTP-Clients fehlgeschlagen")
+    }
+
+    /// Client with production timing; fails if the HTTP client cannot be built.
+    pub fn try_new() -> Result<Self, AppError> {
         Self::with_options(AppClientOptions::default())
     }
 
     /// Client with custom timing. Certificate validation stays on in every case.
-    pub fn with_options(options: AppClientOptions) -> Self {
+    pub fn with_options(options: AppClientOptions) -> Result<Self, AppError> {
         let http = reqwest::Client::builder()
             .timeout(options.request_timeout)
             // A redirect would carry the bearer token to whatever host the server names.
@@ -102,14 +137,14 @@ impl AppClient {
                 env!("CARGO_PKG_VERSION")
             ))
             .build()
-            .unwrap_or_default();
-        Self {
+            .map_err(|_| AppError::ClientInit)?;
+        Ok(Self {
             http,
             options,
             session: Mutex::new(Session::default()),
             cache: Mutex::new(None),
             generation: AtomicU64::new(0),
-        }
+        })
     }
 
     /// Redeems an invite and sets the first password. Does not log in.
@@ -128,7 +163,7 @@ impl AppClient {
         let reply = self
             .post(&endpoint(&base, &["auth", "redeem-invite"]), &body)
             .await
-            .map_err(|e| network_error(&e))?;
+            .map_err(|e| e.app())?;
         if reply.ok() {
             return Ok(());
         }
@@ -160,12 +195,8 @@ impl AppClient {
             });
         }
         let mut session = self.session.lock().await;
-        *session = Session {
-            base_url: Some(base.clone()),
-            device_id: Some(device_id.to_owned()),
-            ..Session::default()
-        };
-        self.generation.fetch_add(1, Ordering::SeqCst);
+        // A new attempt replaces an unfinished one, but the active session stays untouched.
+        session.pending = None;
 
         let body = json!({
             "email": email.trim(),
@@ -176,7 +207,7 @@ impl AppClient {
         let reply = self
             .post(&endpoint(&base, &["auth", "login"]), &body)
             .await
-            .map_err(|e| network_error(&e))?;
+            .map_err(|e| e.app())?;
         match (reply.status, error_code(&reply.body)) {
             (200, _) => {}
             (401, _) => return Err(AppError::InvalidCredentials),
@@ -185,13 +216,19 @@ impl AppClient {
             _ => return Err(server_error(&reply)),
         }
         if let Some(tokens) = self.parse_tokens(&reply.body) {
-            session.tokens = Some(tokens);
+            let old = self.replace_session(&mut session, base, tokens);
+            drop(session);
+            self.revoke(old).await;
             return Ok(AppLoginResult::Ok);
         }
         let mfa = reply.body.get("mfa_required").and_then(Value::as_bool) == Some(true);
         match reply.body.get("mfa_token").and_then(Value::as_str) {
             Some(token) if mfa && !token.is_empty() => {
-                session.pending_mfa = Some(token.to_owned());
+                session.pending = Some(Pending {
+                    base_url: base,
+                    device_id: device_id.to_owned(),
+                    mfa_token: token.to_owned(),
+                });
                 Ok(AppLoginResult::DeviceCodeRequired)
             }
             _ => Err(AppError::InvalidResponse {
@@ -208,32 +245,30 @@ impl AppClient {
             });
         }
         let mut session = self.session.lock().await;
-        let (Some(base), Some(device_id), Some(mfa_token)) = (
-            session.base_url.clone(),
-            session.device_id.clone(),
-            session.pending_mfa.clone(),
-        ) else {
+        let Some(pending) = session.pending.as_ref() else {
             return Err(AppError::NoPendingDeviceCode);
         };
+        let base = pending.base_url.clone();
         let body = json!({
-            "mfa_token": mfa_token,
+            "mfa_token": pending.mfa_token,
             "code": code,
-            "geraete_id": device_id,
+            "geraete_id": pending.device_id,
             "geraete_name": DEVICE_NAME,
         });
         let reply = self
             .post(&endpoint(&base, &["auth", "verify-device"]), &body)
             .await
-            .map_err(|e| network_error(&e))?;
+            .map_err(|e| e.app())?;
         if reply.ok() {
             let tokens = self
                 .parse_tokens(&reply.body)
                 .ok_or(AppError::InvalidResponse {
                     what: "Token fehlen",
                 })?;
-            session.tokens = Some(tokens);
-            session.pending_mfa = None;
-            self.generation.fetch_add(1, Ordering::SeqCst);
+            session.pending = None;
+            let old = self.replace_session(&mut session, base, tokens);
+            drop(session);
+            self.revoke(old).await;
             return Ok(());
         }
         let error = match (reply.status, error_code(&reply.body)) {
@@ -246,7 +281,7 @@ impl AppClient {
         };
         // A wrong code can be retyped; every other failure needs a fresh login and a fresh code.
         if !matches!(error, AppError::CodeWrong | AppError::TooManyRequests) {
-            session.pending_mfa = None;
+            session.pending = None;
         }
         Err(error)
     }
@@ -254,20 +289,40 @@ impl AppClient {
     /// Forgets all tokens and revokes the refresh token on the server. The local state is cleared
     /// even when the server cannot be reached; the refresh token then expires on its own.
     pub async fn logout(&self) -> Result<(), AppError> {
-        let (base, tokens) = {
+        let old = {
             let mut session = self.session.lock().await;
-            session.pending_mfa = None;
+            session.pending = None;
             self.generation.fetch_add(1, Ordering::SeqCst);
             (session.base_url.clone(), session.tokens.take())
         };
+        self.revoke(old).await;
+        Ok(())
+    }
+
+    // Installs a new session and hands back the previous one for revocation.
+    fn replace_session(
+        &self,
+        session: &mut Session,
+        base: Url,
+        tokens: Tokens,
+    ) -> (Option<Url>, Option<Tokens>) {
+        let old = (
+            session.base_url.replace(base),
+            session.tokens.replace(tokens),
+        );
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        old
+    }
+
+    // Best effort: the server answers 204 for every input, and an old refresh token that cannot be
+    // revoked expires on its own.
+    async fn revoke(&self, (base, tokens): (Option<Url>, Option<Tokens>)) {
         if let (Some(base), Some(tokens)) = (base, tokens) {
             let body = json!({"refresh_token": tokens.refresh});
-            // The answer is irrelevant: the server returns 204 for every input.
             let _ = self
                 .post(&endpoint(&base, &["auth", "logout"]), &body)
                 .await;
         }
-        Ok(())
     }
 
     /// What the customer app shows right now. The result is cached for the configured TTL (30 s).
@@ -277,19 +332,26 @@ impl AppClient {
         let mut cache = self.cache.lock().await;
         let generation = self.generation.load(Ordering::SeqCst);
         if let Some(cached) = cache.as_ref() {
-            if cached.generation == generation
+            // Failures count as attempts too, so a broken server is not polled faster than 30 s.
+            // A lost session is the exception: logging in again must work at once.
+            let reusable = match &cached.result {
+                Ok(_) => true,
+                Err(e) => !e.is_session_loss(),
+            };
+            if reusable
+                && cached.generation == generation
                 && cached.fetched.elapsed() < self.options.snapshot_ttl
             {
-                return Ok(cached.snapshot.clone());
+                return cached.result.clone();
             }
         }
-        let snapshot = self.fetch_snapshot().await?;
+        let result = self.fetch_snapshot().await;
         *cache = Some(CachedSnapshot {
             generation,
             fetched: Instant::now(),
-            snapshot: snapshot.clone(),
+            result: result.clone(),
         });
-        Ok(snapshot)
+        result
     }
 
     async fn fetch_snapshot(&self) -> Result<AppViewSnapshot, AppError> {
@@ -457,12 +519,13 @@ impl AppClient {
                 self.end_session(session);
                 Err(AppError::SessionExpired)
             }
+            // The server refused before looking at the token.
             Ok(reply) if reply.status == 429 => Err(AppError::TooManyRequests),
-            Ok(reply) => Err(server_error(&reply)),
             // Not connected means the token was not used; keep it for the next attempt.
-            Err(e) if e.is_connect() => Err(network_error(&e)),
-            // A timeout or broken answer may have rotated the token on the server already.
-            Err(_) => {
+            Err(Failure::Transport(e)) if e.is_connect() => Err(network_error(&e)),
+            // Any other answer (5xx included), a timeout or a broken body may come after the server
+            // rotated the token, and the new one is lost. The old one must not be sent again.
+            Ok(_) | Err(_) => {
                 self.end_session(session);
                 Err(AppError::RefreshUncertain)
             }
@@ -471,7 +534,7 @@ impl AppClient {
 
     fn end_session(&self, session: &mut Session) {
         session.tokens = None;
-        session.pending_mfa = None;
+        session.pending = None;
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -496,8 +559,14 @@ impl AppClient {
         })
     }
 
-    async fn post(&self, url: &Url, body: &Value) -> Result<Reply, reqwest::Error> {
-        let response = self.http.post(url.clone()).json(body).send().await?;
+    async fn post(&self, url: &Url, body: &Value) -> Result<Reply, Failure> {
+        let response = self
+            .http
+            .post(url.clone())
+            .json(body)
+            .send()
+            .await
+            .map_err(Failure::Transport)?;
         read_reply(response).await
     }
 
@@ -508,14 +577,28 @@ impl AppClient {
             .bearer_auth(token)
             .send()
             .await
-            .map_err(|e| network_error(&e))?;
-        read_reply(response).await.map_err(|e| network_error(&e))
+            .map_err(|e| Failure::Transport(e).app())?;
+        read_reply(response).await.map_err(|f| f.app())
     }
 }
 
-async fn read_reply(response: reqwest::Response) -> Result<Reply, reqwest::Error> {
+/// Reads the body in chunks and stops as soon as it exceeds the limit, so a hostile or broken
+/// server cannot make the app allocate unbounded memory.
+async fn read_reply(mut response: reqwest::Response) -> Result<Reply, Failure> {
     let status = response.status().as_u16();
-    let bytes = response.bytes().await?;
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_BODY_BYTES as u64)
+    {
+        return Err(Failure::TooLarge);
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(Failure::Transport)? {
+        if bytes.len() + chunk.len() > MAX_BODY_BYTES {
+            return Err(Failure::TooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     // Empty and non-JSON bodies (204, proxy error pages) are normal; they become `null`.
     let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     Ok(Reply { status, body })
@@ -529,7 +612,14 @@ fn fold(
 ) -> Result<Option<Value>, AppError> {
     match result {
         Ok(body) => {
-            raw.insert(path.to_owned(), body.clone());
+            // The summary is read from the full body; only the copy for display is capped.
+            let size = serde_json::to_vec(&body).map_or(usize::MAX, |v| v.len());
+            let shown = if size > MAX_RAW_BYTES {
+                error_json("Antwort zu groß für die Anzeige")
+            } else {
+                body.clone()
+            };
+            raw.insert(path.to_owned(), shown);
             Ok(Some(body))
         }
         Err(
