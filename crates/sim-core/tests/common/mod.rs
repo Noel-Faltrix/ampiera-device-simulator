@@ -512,7 +512,7 @@ fn answer_call(
         "StartTransaction" => {
             let rejecting = shared
                 .reject_starts
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok();
             if rejecting {
                 return Ok(json!({"transactionId": 0, "idTagInfo": {"status": "Invalid"}}));
