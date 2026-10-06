@@ -1,32 +1,18 @@
 /*
- * Design-Tokens des Ampiera Support-Leitstands.
+ * Design tokens of the Ampiera Device Simulator, taken from the Ampiera main rule set, section 5.1.
  *
- * SEIT 15.09.2026 AUF DER MARKENPALETTE. Vorher lief das Dashboard auf dem
- * Teal des ersten Konzept-Mockups (dashboard.html) — eine Farbe, die mit
- * dem Ampiera-Logo nichts zu tun hat. Jetzt gelten dieselben Werte wie auf
- * der Webseite: Markengruen #3b6f2a als dominante Farbe, das dunklere
- * #2a5a1f fuer Hover/Aktiv, #2e7d0b fuer Links und Fokus.
+ * Blue brand palette since 06.10.2026 (Noel's decision): brand blue #1f4e8c is the dominant colour,
+ * #163b6b is hover/active, the light "power accent" #2e8fd6 is for areas, bars and icons only.
+ * The roles are the same as in the former green palette; only the values changed.
  *
- * DREI ZUSTAENDE, unveraendert: helles Grundschema, automatischer Dark-Mode
- * ueber prefers-color-scheme, und ein ausdruecklicher Umschalter ueber
- * [data-theme] (noch kein UI-Schalter, die Tokens sind aber vorbereitet).
- * Die Markenpalette gibt es nur in hell — die dunklen Werte sind daraus
- * abgeleitet: dieselben Farbtoene, aufgehellt bis sie auf dunklem Grund
- * lesbar sind, und die neutralen Graustufen leicht ins Gruene gezogen,
- * damit sie zur Marke passen statt zum alten Teal.
+ * Success is green again (#1a7a3e). It was teal while the brand was green, so that a green area
+ * never read as a status message. With a blue brand, green is unambiguous for "all good".
  *
- * ERFOLG IST ABSICHTLICH TEAL, NICHT GRUEN (#0F766E). Die Begruendung
- * stammt aus der Markenpalette und wiegt im Dashboard schwerer als auf der
- * Webseite: Wenn die Markenfarbe gruen ist und "in Ordnung" ebenfalls,
- * liest sich jede gruene Flaeche als Statusmeldung — oder umgekehrt jede
- * Statusmeldung als Dekoration. Im Leitstand, wo jemand auf einen Blick
- * sehen muss, welche Anlage Aerger macht, ist das keine Geschmacksfrage.
+ * Three states: light, automatic dark via prefers-color-scheme, and explicit [data-theme]. The dark
+ * values are therefore written twice; whoever changes one block changes both.
  *
- * KONTRAST: Alle Textfarben sind gegen ihre Hintergruende nachgerechnet und
- * erreichen mindestens 4,5:1 (WCAG AA). Drei Werte der alten Palette taten
- * das NICHT — text-muted (3,49), warning (3,63) und good (3,35) auf Weiss.
- * Sie sind bei dieser Gelegenheit nachgezogen worden; das ist eine
- * Korrektur, keine Geschmacksaenderung.
+ * Contrast: every text colour reaches at least 4.5:1 against the surfaces it sits on (WCAG AA),
+ * borders of inputs at least 3:1 (WCAG 1.4.11). Recalculated on 06.10.2026.
  */
 
 :root {
@@ -39,26 +25,22 @@
   /* Hoehe der klebenden Kopfzeile (Block 3a, 05.10.2026). Seiten mit eigener
      Bildschirmhoehe oder klebenden Spalten rechnen sie ab. */
   --kopf-hoehe: 56px;
-  --bg: #f4f7f3;
+  --bg: #f3f6fa;
   --surface: #ffffff;
-  --surface-2: #e6ece4;
-  --surface-hover: #dde5da;
-  --border: #d5ded3;
-  --border-strong: #b9c6b6;
-  --text-primary: #16241a;
-  --text-secondary: #4b5f4e;
-  /* NACHGEZOGEN 05.10.2026: #5f6f61 erreichte auf --surface-hover nur 4,14:1
-     und auf --surface-2 4,45:1, also unter AA. Mit #5a695c (gleicher Farbton,
-     etwas dunkler) liegt der Text auf allen Flaechen bei mindestens 4,5:1.
-     Vorher (#7c8c90) lag er bei 3,49 auf Weiss. */
-  --text-muted: #5a695c;
-  --accent: #3b6f2a;
-  --accent-strong: #2a5a1f;
-  --accent-wash: #e7f0e2;
-  /* Das helle Logo-Gruen. NUR fuer Flaechen, Balken und Icons — nie fuer
-     Schrift auf Weiss, dort reicht der Kontrast nicht (2,7:1). */
-  --accent-hell: #3ba100;
-  --navy: #1f3b57;
+  --surface-2: #e4eaf2;
+  --surface-hover: #e8eef5;
+  --border: #d2dbe6;
+  --border-strong: #b3c1d1;
+  --text-primary: #13202e;
+  --text-secondary: #465a6f;
+  /* At least 4.5:1 on every surface, including --surface-2 and --surface-hover. */
+  --text-muted: #56677a;
+  --accent: #1f4e8c;
+  --accent-strong: #163b6b;
+  --accent-wash: #e6eef7;
+  /* Power accent: areas, bars and icons only, never text on white (3.5:1). */
+  --accent-hell: #2e8fd6;
+  --navy: #0e2340;
   /* Schrift, die AUF einer gesaettigten Flaeche sitzt (Primaerknopf,
      Gefahrenknopf, aktiver Chip, Zaehler-Badge). Im hellen Schema sind
      diese Flaechen dunkel, also weiss darauf. Im dunklen Schema sind sie
@@ -66,20 +48,20 @@
      ueberall fest #fff, und im Dark Mode ergab das 2,3:1 auf dem
      Primaerknopf: lesbar nur, wenn man weiss, was dort steht. */
   --auf-farbe: #ffffff;
-  /* Teal statt Gruen, siehe Kopfkommentar. */
-  --good: #0f766e;
+  /* Green, see header. */
+  --good: #1a7a3e;
   --warning: #8a5a00;
   --serious: #a8441d;
   --critical: #b3261e;
-  --good-wash: #ddefec;
+  --good-wash: #e0f1e6;
   --warning-wash: #fbf0dd;
   --serious-wash: #fbe8de;
   --critical-wash: #f7e0de;
-  --shadow: 0 1px 2px rgba(22, 36, 26, 0.06), 0 4px 16px rgba(22, 36, 26, 0.06);
+  --shadow: 0 1px 2px rgba(19, 32, 46, 0.06), 0 4px 16px rgba(19, 32, 46, 0.06);
   /* Code-Blöcke im Wiki: dunkel in beiden Schemata (Block 3a). Text 13,7:1 bzw. 16,5:1, gedämpft 7,8:1 bzw. 8,0:1. */
-  --code-bg: #16241a;
-  --code-text: #e6efe3;
-  --code-muted: #a9b8a7;
+  --code-bg: #13202e;
+  --code-text: #e8eef6;
+  --code-muted: #a9b6c6;
   --code-linie: rgba(255, 255, 255, 0.08);
   --code-linie-stark: rgba(255, 255, 255, 0.28);
 
@@ -89,8 +71,8 @@
      nehmen, nicht auffallen. Panels und Sidebar haben eigene, deckende
      Hintergruende, der Text sitzt also nie auf der Struktur; am Kontrast
      aendert sich nichts. */
-  --bg-punkt: rgba(22, 36, 26, 0.06);
-  --bg-schimmer: rgba(59, 111, 42, 0.05);
+  --bg-punkt: rgba(19, 32, 46, 0.06);
+  --bg-schimmer: rgba(31, 78, 140, 0.05);
 
   /* Ampiera-Brain-Notiztypen (AP Core) — bug/feature/offener-punkt/
      entscheidung leihen sich bewusst die bestehenden Status-/Akzentfarben
@@ -165,7 +147,7 @@
   --space-7: 48px;
 
   /* ≥ 3:1 gegen surface (WCAG 1.4.11), 06.10.2026 */
-  --border-input: #7a8c78;
+  --border-input: #6b7d90;
 }
 
 /* Die dunklen Werte stehen absichtlich zweimal: einmal fuer die
@@ -175,35 +157,35 @@
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     color-scheme: dark;
-    --bg: #0f1411;
-    --surface: #171e18;
-    --surface-2: #1d261e;
-    --surface-hover: #243024;
-    --border: #2c3a2d;
-    --border-strong: #3d4c3e;
-    --text-primary: #edf3ec;
-    --text-secondary: #b0bdaf;
-    --text-muted: #8b9a8c;
-    --accent: #6fbf4a;
-    --accent-strong: #83cc63;
-    --accent-wash: #1b2e16;
-    --accent-hell: #7ed13f;
-    --navy: #7c97ae;
-    --auf-farbe: #0f1411;
-    --good: #45bfb0;
+    --bg: #0b111a;
+    --surface: #121a25;
+    --surface-2: #19232f;
+    --surface-hover: #1d2835;
+    --border: #2a3748;
+    --border-strong: #3a4a5e;
+    --text-primary: #e8eef6;
+    --text-secondary: #a9b6c6;
+    --text-muted: #8695a8;
+    --accent: #6aa8ee;
+    --accent-strong: #8dbdf3;
+    --accent-wash: #14233a;
+    --accent-hell: #4fb6ea;
+    --navy: #8db0da;
+    --auf-farbe: #0b111a;
+    --good: #4cc27e;
     --warning: #fab219;
     --serious: #ec835a;
     --critical: #e8645a;
-    --good-wash: #13302c;
+    --good-wash: #12301f;
     --warning-wash: #332608;
     --serious-wash: #33190d;
     --critical-wash: #35171a;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.35);
-    --code-bg: #0a0e0b;
-    --code-text: #e6efe3;
-    --code-muted: #9aab98;
+    --code-bg: #070b11;
+    --code-text: #e8eef6;
+    --code-muted: #9aa8b9;
     --bg-punkt: rgba(255, 255, 255, 0.05);
-    --bg-schimmer: rgba(111, 191, 74, 0.05);
+    --bg-schimmer: rgba(106, 168, 238, 0.05);
 
     --zk-wochenende: #27271a;
     --zk-feiertag: #232719;
@@ -232,41 +214,41 @@
     --type-skill: #9fb0bd;
 
     /* ≥ 3:1 gegen surface (WCAG 1.4.11), 06.10.2026 */
-    --border-input: #6a7d6b;
+    --border-input: #66798f;
   }
 }
 
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #0f1411;
-  --surface: #171e18;
-  --surface-2: #1d261e;
-  --surface-hover: #243024;
-  --border: #2c3a2d;
-  --border-strong: #3d4c3e;
-  --text-primary: #edf3ec;
-  --text-secondary: #b0bdaf;
-  --text-muted: #8b9a8c;
-  --accent: #6fbf4a;
-  --accent-strong: #83cc63;
-  --accent-wash: #1b2e16;
-  --accent-hell: #7ed13f;
-  --navy: #7c97ae;
-  --auf-farbe: #0f1411;
-  --good: #45bfb0;
+  --bg: #0b111a;
+  --surface: #121a25;
+  --surface-2: #19232f;
+  --surface-hover: #1d2835;
+  --border: #2a3748;
+  --border-strong: #3a4a5e;
+  --text-primary: #e8eef6;
+  --text-secondary: #a9b6c6;
+  --text-muted: #8695a8;
+  --accent: #6aa8ee;
+  --accent-strong: #8dbdf3;
+  --accent-wash: #14233a;
+  --accent-hell: #4fb6ea;
+  --navy: #8db0da;
+  --auf-farbe: #0b111a;
+  --good: #4cc27e;
   --warning: #fab219;
   --serious: #ec835a;
   --critical: #e8645a;
-  --good-wash: #13302c;
+  --good-wash: #12301f;
   --warning-wash: #332608;
   --serious-wash: #33190d;
   --critical-wash: #35171a;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.35);
-  --code-bg: #0a0e0b;
-  --code-text: #e6efe3;
-  --code-muted: #9aab98;
+  --code-bg: #070b11;
+  --code-text: #e8eef6;
+  --code-muted: #9aa8b9;
   --bg-punkt: rgba(255, 255, 255, 0.05);
-  --bg-schimmer: rgba(111, 191, 74, 0.05);
+  --bg-schimmer: rgba(106, 168, 238, 0.05);
 
   --zk-wochenende: #27271a;
   --zk-feiertag: #232719;
@@ -295,5 +277,5 @@
   --type-skill: #9fb0bd;
 
   /* ≥ 3:1 gegen surface (WCAG 1.4.11), 06.10.2026 */
-  --border-input: #6a7d6b;
+  --border-input: #66798f;
 }
