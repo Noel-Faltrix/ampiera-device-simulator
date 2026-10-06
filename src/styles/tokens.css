@@ -163,6 +163,9 @@
   --space-5: 24px;
   --space-6: 32px;
   --space-7: 48px;
+
+  /* ≥ 3:1 gegen surface (WCAG 1.4.11), 06.10.2026 */
+  --border-input: #7a8c78;
 }
 
 /* Die dunklen Werte stehen absichtlich zweimal: einmal fuer die
@@ -227,6 +230,9 @@
     --type-plan: #c49ad8;
     --type-roadmap-stufe: #b0b0e0;
     --type-skill: #9fb0bd;
+
+    /* ≥ 3:1 gegen surface (WCAG 1.4.11), 06.10.2026 */
+    --border-input: #6a7d6b;
   }
 }
 
@@ -287,4 +293,7 @@
   --type-plan: #c49ad8;
   --type-roadmap-stufe: #b0b0e0;
   --type-skill: #9fb0bd;
+
+  /* ≥ 3:1 gegen surface (WCAG 1.4.11), 06.10.2026 */
+  --border-input: #6a7d6b;
 }

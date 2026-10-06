@@ -35,6 +35,7 @@ export function makeBox(
     profileCount: 0,
     heartbeatIntervalS: 300,
     lastError: null,
+    updatedAt: "2026-10-06T18:15:03Z",
     ...overrides,
   };
 }

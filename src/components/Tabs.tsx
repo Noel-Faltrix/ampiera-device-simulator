@@ -76,6 +76,7 @@ export function Tabs<T extends string>({
         id={`${idPrefix}-panel`}
         aria-labelledby={`${idPrefix}-tab-${active}`}
         className="tabpanel"
+        tabIndex={0}
       >
         {children}
       </div>

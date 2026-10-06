@@ -16,9 +16,8 @@ import type {
   ScenarioInfo,
   ScenarioReport,
 } from "../api/types";
+import { FRAME_CAP } from "../lib/constants";
 import { errorMessage } from "../lib/errors";
-
-export const FRAME_CAP = 2000;
 
 export type AppAuth = "loggedOut" | "codeRequired" | "loggedIn";
 
@@ -32,12 +31,18 @@ export interface SimState {
   scenarios: ScenarioInfo[];
   scenariosError: string | null;
   reports: Record<string, ScenarioReport>;
+  /** Markdown of each report, fetched when the report arrives so copying needs no await. */
+  reportMarkdown: Record<string, string>;
+  restoreProblems: string[];
   running: Record<string, { scenarioId: ScenarioId; startedAt: number }>;
-  app: { auth: AppAuth; snapshot: AppViewSnapshot | null; error: string | null };
+  app: { auth: AppAuth; snapshot: AppViewSnapshot | null; error: string | null; live: boolean };
 }
 
 export type SimAction =
   | { type: "loaded"; boxes: ChargePointSnapshot[] }
+  | { type: "restoreProblem"; message: string }
+  | { type: "dismissProblem"; index: number }
+  | { type: "reportMarkdown"; key: string; markdown: string }
   | { type: "loadFailed"; message: string }
   | { type: "updated"; snapshot: ChargePointSnapshot }
   | { type: "removed"; id: string }
@@ -48,7 +53,7 @@ export type SimAction =
   | { type: "report"; report: ScenarioReport }
   | { type: "runStarted"; id: string; scenarioId: ScenarioId; at: number }
   | { type: "runEnded"; id: string }
-  | { type: "appAuth"; auth: AppAuth }
+  | { type: "appAuth"; auth: AppAuth; live?: boolean }
   | { type: "appSnapshot"; snapshot: AppViewSnapshot }
   | { type: "appError"; message: string };
 
@@ -62,8 +67,10 @@ export const initialState: SimState = {
   scenarios: [],
   scenariosError: null,
   reports: {},
+  reportMarkdown: {},
+  restoreProblems: [],
   running: {},
-  app: { auth: "loggedOut", snapshot: null, error: null },
+  app: { auth: "loggedOut", snapshot: null, error: null, live: false },
 };
 
 export const reportKey = (boxId: string, scenarioId: ScenarioId) => `${boxId}:${scenarioId}`;
@@ -85,9 +92,26 @@ function upsert(state: SimState, snapshot: ChargePointSnapshot): SimState {
 export function reducer(state: SimState, action: SimAction): SimState {
   switch (action.type) {
     case "loaded": {
-      const next = action.boxes.reduce(upsert, state);
+      // An event may have delivered a newer snapshot while the list call was in flight.
+      const fresh = action.boxes.filter((box) => {
+        const known = state.boxes[box.id];
+        return !known || Date.parse(known.updatedAt) <= Date.parse(box.updatedAt);
+      });
+      const next = fresh.reduce(upsert, state);
       return { ...next, ready: true, loadError: null };
     }
+    case "restoreProblem":
+      return { ...state, restoreProblems: [...state.restoreProblems, action.message] };
+    case "dismissProblem":
+      return {
+        ...state,
+        restoreProblems: state.restoreProblems.filter((_, i) => i !== action.index),
+      };
+    case "reportMarkdown":
+      return {
+        ...state,
+        reportMarkdown: { ...state.reportMarkdown, [action.key]: action.markdown },
+      };
     case "loadFailed":
       return { ...state, ready: true, loadError: action.message };
     case "updated":
@@ -107,6 +131,9 @@ export function reducer(state: SimState, action: SimAction): SimState {
         boxes,
         frames,
         reports,
+        reportMarkdown: Object.fromEntries(
+          Object.entries(state.reportMarkdown).filter(([key]) => !key.startsWith(prefix)),
+        ),
         running,
         selectedId: state.selectedId === action.id ? (order[0] ?? null) : state.selectedId,
       };
@@ -153,6 +180,7 @@ export function reducer(state: SimState, action: SimAction): SimState {
           auth: action.auth,
           snapshot: action.auth === "loggedOut" ? null : state.app.snapshot,
           error: null,
+          live: action.auth === "loggedOut" ? false : (action.live ?? state.app.live),
         },
       };
     case "appSnapshot":
@@ -183,6 +211,7 @@ export function SimProvider({ children }: { children: ReactNode }) {
           onChargePointUpdated: (snapshot) => dispatch({ type: "updated", snapshot }),
           onFrameLogged: (entry) => dispatch({ type: "frame", entry }),
           onChargePointRemoved: (id) => dispatch({ type: "removed", id }),
+          onRestoreProblem: (message) => dispatch({ type: "restoreProblem", message }),
         });
         if (cancelled) off();
         else unsubscribe = off;

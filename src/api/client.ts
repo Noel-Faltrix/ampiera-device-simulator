@@ -37,6 +37,9 @@ export const abortScenario = (id: string) => invoke<void>("abort_scenario", { id
 export const exportLog = (id: string) => invoke<string>("export_log", { id });
 export const exportReport = (report: ScenarioReport) => invoke<string>("export_report", { report });
 
+export const saveLog = (id: string) => invoke<string>("save_log", { id });
+export const saveReport = (report: ScenarioReport) => invoke<string>("save_report", { report });
+
 export const appRedeemInvite = (args: {
   baseUrl: string;
   email: string;
@@ -53,9 +56,10 @@ export interface EventHandlers {
   onChargePointUpdated: (snapshot: ChargePointSnapshot) => void;
   onFrameLogged: (entry: FrameLogEntry) => void;
   onChargePointRemoved: (id: string) => void;
+  onRestoreProblem: (message: string) => void;
 }
 
-/** Registers all three event listeners; resolves to one function that removes them. */
+/** Registers all event listeners; resolves to one function that removes them. */
 export async function subscribe(handlers: EventHandlers): Promise<() => void> {
   const unlisteners: UnlistenFn[] = [];
   try {
@@ -66,6 +70,9 @@ export async function subscribe(handlers: EventHandlers): Promise<() => void> {
       await listen<FrameLogEntry>("frame-logged", (e) => handlers.onFrameLogged(e.payload)),
       await listen<{ id: string }>("charge-point-removed", (e) =>
         handlers.onChargePointRemoved(e.payload.id),
+      ),
+      await listen<{ message: string }>("restore-problem", (e) =>
+        handlers.onRestoreProblem(e.payload.message),
       ),
     );
   } catch (error) {

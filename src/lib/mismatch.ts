@@ -12,13 +12,13 @@ export interface CompareRow {
   note: string | null;
 }
 
-/** Same tolerance as scenario S11, with a floor so tiny values do not trip on rounding. */
+/** Same rule as scenario S11 in the core: within 10 %; below 100 W on both sides counts as equal. */
 const POWER_TOLERANCE_RATIO = 0.1;
-const POWER_TOLERANCE_FLOOR_W = 50;
+const NEGLIGIBLE_POWER_W = 100;
 
 export function powersAgree(boxW: number, appW: number): boolean {
-  const tolerance = Math.max(Math.abs(boxW) * POWER_TOLERANCE_RATIO, POWER_TOLERANCE_FLOOR_W);
-  return Math.abs(boxW - appW) <= tolerance;
+  if (Math.abs(boxW) < NEGLIGIBLE_POWER_W && Math.abs(appW) < NEGLIGIBLE_POWER_W) return true;
+  return Math.abs(boxW - appW) <= Math.abs(boxW) * POWER_TOLERANCE_RATIO;
 }
 
 function isOffline(value: string | null): boolean {
@@ -52,7 +52,7 @@ export function compareBoxWithApp(box: ChargePointSnapshot, app: AppViewSummary)
       "Die App bekommt keine Ladeleistung der Wallbox. Der Server liest sie aus einer Quelle, in die OCPP nicht schreibt.";
   } else if (box.powerW === null) {
     powerState = "info";
-    powerNote = "Die Box meldet gerade keine Leistung, ein Vergleich ist nicht möglich.";
+    powerNote = "Die Wallbox meldet gerade keine Leistung, ein Vergleich ist nicht möglich.";
   } else if (powersAgree(box.powerW, app.livePowerW)) {
     powerState = "match";
   } else {
@@ -76,7 +76,7 @@ export function compareBoxWithApp(box: ChargePointSnapshot, app: AppViewSummary)
     statusNote = "Die App bekommt weder Gerätestatus noch Zustand der Wallbox.";
   } else if (boxConnected && (isOffline(app.deviceStatus) || isOffline(app.geoState))) {
     statusState = "mismatch";
-    statusNote = "Die Box ist verbunden, die App zeigt sie als nicht erreichbar.";
+    statusNote = "Die Wallbox ist verbunden, die App zeigt sie als nicht erreichbar.";
   } else {
     statusState = "info";
     statusNote = "Die Werte der App haben kein festes Gegenstück im OCPP-Status.";
@@ -102,8 +102,8 @@ export function compareBoxWithApp(box: ChargePointSnapshot, app: AppViewSummary)
     } else {
       connState = "mismatch";
       connNote = boxConnected
-        ? "Die Box ist verbunden, die App zeigt die Anlage nicht als online."
-        : "Die Box ist getrennt, die App zeigt die Anlage noch als online. Das kann kurz nachlaufen.";
+        ? "Die Wallbox ist verbunden, die App zeigt die Anlage nicht als online."
+        : "Die Wallbox ist getrennt, die App zeigt die Anlage noch als online. Das kann kurz nachlaufen.";
     }
   }
   rows.push({

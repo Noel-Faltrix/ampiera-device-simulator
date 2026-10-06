@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { ChargePointSnapshot } from "../api/types";
+import { LIVE_BANNER } from "../lib/constants";
 import { AppViewTab } from "./AppViewTab";
 import { ConnectionIndicator, TargetBadge } from "./badges";
 import { LogTab } from "./LogTab";
@@ -20,12 +21,21 @@ export function BoxDetail({ box }: { box: ChargePointSnapshot }) {
   const [tab, setTab] = useState<TabId>("overview");
   return (
     <section className="detail" aria-label={`Wallbox ${box.config.label}`}>
-      <div className={`detail-head${box.config.targetKind === "live" ? " detail-head-live" : ""}`}>
-        <h2>{box.config.label}</h2>
-        <TargetBadge kind={box.config.targetKind} />
-        <span className="mono">{box.config.identity}</span>
-        <ConnectionIndicator box={box} />
-        <span className="mono muted detail-url">{box.config.baseUrl}</span>
+      <div className="detail-top">
+        <div
+          className={`detail-head${box.config.targetKind === "live" ? " detail-head-live" : ""}`}
+        >
+          <h2>{box.config.label}</h2>
+          <TargetBadge kind={box.config.targetKind} />
+          <span className="mono">{box.config.identity}</span>
+          <ConnectionIndicator box={box} />
+          <span className="mono muted detail-url">{box.config.baseUrl}</span>
+        </div>
+        {box.config.targetKind === "live" ? (
+          <p className="live-banner" role="note">
+            {LIVE_BANNER}
+          </p>
+        ) : null}
       </div>
       {box.connection.state === "failed" ? (
         <p className="notice notice-critical" role="alert">

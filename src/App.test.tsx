@@ -90,7 +90,7 @@ describe("App", () => {
     vi.mocked(api.reboot).mockRejectedValue("Die Box ist nicht verbunden.");
     const user = setup();
     render(<App />);
-    await user.click(await screen.findByRole("button", { name: "Box neu starten" }));
+    await user.click(await screen.findByRole("button", { name: "Wallbox neu starten" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Die Box ist nicht verbunden.");
   });
 
@@ -100,21 +100,94 @@ describe("App", () => {
     render(<App />);
     await user.click(await screen.findByRole("button", { name: "Entfernen" }));
     expect(api.removeChargePoint).not.toHaveBeenCalled();
-    await user.click(screen.getByRole("button", { name: "Ja, entfernen" }));
+    await user.click(screen.getByRole("button", { name: "Entfernen" }));
     expect(api.removeChargePoint).toHaveBeenCalledWith("box-local");
   });
 
+  it("warns on a live wallbox with a banner and not on a local one", async () => {
+    setup([makeBox({}, true)]);
+    const { unmount } = render(<App />);
+    expect(
+      await screen.findByText(
+        "Live: Diese Wallbox ist mit dem Produktivserver verbunden. Aktionen wirken auf den echten Betrieb.",
+      ),
+    ).toBeInTheDocument();
+    unmount();
+    setup([makeBox()]);
+    render(<App />);
+    await screen.findByText("Stand:", { exact: false });
+    expect(screen.queryByText(/Aktionen wirken auf den echten Betrieb/)).not.toBeInTheDocument();
+  });
+
+  it("shows the time of the last state change and flags stale values", async () => {
+    setup([makeBox({ connection: { state: "disconnected" } })]);
+    render(<App />);
+    const stand = await screen.findByText(/^Stand: \d\d\.\d\d\.\d{4}, \d\d:\d\d:\d\d/);
+    expect(stand).toHaveTextContent("Werte vom letzten Kontakt");
+  });
+
+  it("shows restore problems and lets the user dismiss them", async () => {
+    let problem: (m: string) => void = () => {};
+    vi.mocked(api.subscribe).mockImplementation((handlers) => {
+      problem = handlers.onRestoreProblem;
+      return Promise.resolve(() => {});
+    });
+    vi.mocked(api.listChargePoints).mockImplementation(() => {
+      problem("Das Passwort fehlt im Schlüsselbund.");
+      return Promise.resolve([]);
+    });
+    vi.mocked(api.listScenarios).mockResolvedValue(scenarios);
+    const user = userEvent.setup();
+    render(<App />);
+    expect(
+      await screen.findByText("Nicht wiederhergestellt: Das Passwort fehlt im Schlüsselbund."),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Schließen" }));
+    expect(screen.queryByText(/Nicht wiederhergestellt/)).not.toBeInTheDocument();
+  });
+
+  it("renders the vehicle charge level without inline styles", async () => {
+    setup([
+      makeBox({
+        vehicle: {
+          config: { capacityKwh: 60, socPct: 30, maxPowerW: 11000, phases: 3 },
+          socPct: 42,
+          plugged: true,
+        },
+      }),
+    ]);
+    const { container } = render(<App />);
+    expect(
+      await screen.findByRole("progressbar", { name: "Ladestand des Fahrzeugs" }),
+    ).toHaveAttribute("value", "42");
+    expect(container.querySelector("[style]")).toBeNull();
+  });
+
   describe("scenarios", () => {
+    it("explains why start is disabled while another scenario runs", async () => {
+      vi.mocked(api.runScenario).mockReturnValue(new Promise(() => {}));
+      const user = setup();
+      render(<App />);
+      await openTab(user, "Szenarien");
+      const first = (await screen.findByText("Anmelden, Status, Heartbeat")).closest("li")!;
+      await user.click(within(first).getByRole("button", { name: "Starten" }));
+      const other = screen.getByText("Falsches Passwort").closest("li")!;
+      const button = within(other).getByRole("button", { name: "Starten" });
+      expect(button).toBeDisabled();
+      expect(button).toHaveAccessibleDescription("Auf dieser Wallbox läuft bereits ein Szenario.");
+      expect(within(first).getByText("Szenario gestartet")).toBeInTheDocument();
+    });
+
     it("disables local-only scenarios on a live box and says why", async () => {
       const user = setup([makeBox({}, true)]);
       render(<App />);
       await openTab(user, "Szenarien");
       const item = (await screen.findByText("Falsches Passwort")).closest("li")!;
-      expect(within(item).getByRole("button", { name: "Starten" })).toBeDisabled();
-      expect(within(item).getByText("nur lokal")).toBeInTheDocument();
-      expect(within(item).getByText(/läuft nur auf lokalen Boxen/)).toBeInTheDocument();
+      expect(within(item).getByRole("button", { name: "Auf Live starten" })).toBeDisabled();
+      expect(within(item).getByText("nur lokal ausführbar")).toBeInTheDocument();
+      expect(within(item).getByText(/läuft nur auf lokalen Wallboxen/)).toBeInTheDocument();
       const allowed = screen.getByText("Anmelden, Status, Heartbeat").closest("li")!;
-      expect(within(allowed).getByRole("button", { name: "Starten" })).toBeEnabled();
+      expect(within(allowed).getByRole("button", { name: "Auf Live starten" })).toBeEnabled();
     });
 
     it("allows the same scenario on a local box", async () => {
@@ -130,8 +203,8 @@ describe("App", () => {
       render(<App />);
       await openTab(user, "Szenarien");
       const item = (await screen.findByText("Testgrenze aus dem Intranet")).closest("li")!;
-      expect(within(item).getByText("braucht Mitwirkung")).toBeInTheDocument();
-      expect(within(item).getByText("Timeout 20 min")).toBeInTheDocument();
+      expect(within(item).getByText("Handlung nötig")).toBeInTheDocument();
+      expect(within(item).getByText("Zeitlimit 20 min")).toBeInTheDocument();
     });
 
     it("runs a scenario, shows the report and copies it as markdown", async () => {
@@ -172,12 +245,32 @@ describe("App", () => {
       expect(within(item).getByText("übersprungen")).toBeInTheDocument();
       expect(within(item).getByText("Keine Antwort in 10 s.")).toBeInTheDocument();
 
-      await user.click(within(item).getByRole("button", { name: "Bericht kopieren" }));
+      const copyButton = within(item).getByRole("button", { name: "Bericht kopieren" });
+      await waitFor(() => expect(copyButton).toBeEnabled());
+      await user.click(copyButton);
       await waitFor(() => expect(writeText).toHaveBeenCalledWith("# Bericht"));
+
+      vi.mocked(api.saveReport).mockResolvedValue("/home/u/Downloads/bericht.md");
+      await user.click(within(item).getByRole("button", { name: "Bericht speichern" }));
+      expect(
+        await within(item).findByText("Gespeichert unter /home/u/Downloads/bericht.md"),
+      ).toBeInTheDocument();
     });
   });
 
   describe("protocol", () => {
+    it("saves the log through the core and shows the path", async () => {
+      vi.mocked(api.saveLog).mockResolvedValue("/home/u/Downloads/protokoll.json");
+      const user = setup();
+      render(<App />);
+      await openTab(user, "Protokoll");
+      await user.click(await screen.findByRole("button", { name: "Exportieren" }));
+      expect(api.saveLog).toHaveBeenCalledWith("box-local");
+      expect(
+        await screen.findByText("Gespeichert unter /home/u/Downloads/protokoll.json"),
+      ).toBeInTheDocument();
+    });
+
     it("filters frames by action name", async () => {
       let emit: (e: {
         chargePointId: string;
@@ -206,7 +299,7 @@ describe("App", () => {
       expect(screen.getByText("1 von 2 Einträgen")).toBeInTheDocument();
       expect(screen.queryByText("Heartbeat")).not.toBeInTheDocument();
       expect(screen.getByText("MeterValues")).toBeInTheDocument();
-      expect(screen.getAllByText("→ Zentrale")).toHaveLength(1);
+      expect(screen.getAllByText("an die Zentrale")).toHaveLength(1);
     });
   });
 

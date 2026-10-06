@@ -4,16 +4,21 @@ import type { ChargePointSnapshot, TargetKind } from "../api/types";
 import { errorMessage } from "../lib/errors";
 import { DASH, formatClock, formatDateTime, formatPower } from "../lib/format";
 import { compareBoxWithApp, type CompareState } from "../lib/mismatch";
-import { DEFAULT_APP_URL, MIN_NEW_PASSWORD_LENGTH } from "../lib/validation";
+import { APP_POLL_SECONDS, LIVE_APP_NOTICE } from "../lib/constants";
+import { DEFAULT_APP_URL, MIN_NEW_PASSWORD_LENGTH, isPublicUrl } from "../lib/validation";
 import { useSim } from "../state/store";
 import { Field } from "./Field";
 
-const POLL_INTERVAL_MS = 30_000;
+const POLL_INTERVAL_MS = APP_POLL_SECONDS * 1000;
 
 type ServerChoice = TargetKind | "custom";
 
 function resolveBaseUrl(choice: ServerChoice, custom: string): string {
   return choice === "custom" ? custom.trim().replace(/\/+$/, "") : DEFAULT_APP_URL[choice];
+}
+
+function isLiveChoice(choice: ServerChoice, custom: string): boolean {
+  return choice === "live" || (choice === "custom" && isPublicUrl(custom));
 }
 
 function ServerSelect({
@@ -38,6 +43,11 @@ function ServerSelect({
           </select>
         )}
       </Field>
+      {isLiveChoice(choice, custom) ? (
+        <p className="notice notice-warning" role="note">
+          {LIVE_APP_NOTICE}
+        </p>
+      ) : null}
       {choice === "custom" ? (
         <Field label="Adresse des Servers">
           {(p) => (
@@ -104,7 +114,7 @@ function InviteForm({ choice, custom }: { choice: ServerChoice; custom: string }
             />
           )}
         </Field>
-        <Field label="Einladungs-Token">
+        <Field label="Einladungscode">
           {(p) => (
             <input
               {...p}
@@ -178,6 +188,7 @@ function LoginPanel({ box }: { box: ChargePointSnapshot }) {
       dispatch({
         type: "appAuth",
         auth: result.result === "ok" ? "loggedIn" : "codeRequired",
+        live: isLiveChoice(choice, custom),
       });
     } catch (e) {
       setError(errorMessage(e));
@@ -216,6 +227,7 @@ function LoginPanel({ box }: { box: ChargePointSnapshot }) {
               inputMode="numeric"
               autoComplete="one-time-code"
               maxLength={6}
+              autoFocus
               className="mono code-input"
               value={code}
               onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
@@ -248,7 +260,7 @@ function LoginPanel({ box }: { box: ChargePointSnapshot }) {
       <form className="login" onSubmit={(e) => void login(e)} noValidate>
         <h3>Als Testkunde anmelden</h3>
         <p className="muted">
-          Die App-Sicht zeigt, was die Kunden-App vom Server bekommt. Sie liest nur.
+          Die App-Sicht zeigt, was die Kunden-App vom Server bekommt. Die App-Sicht schreibt nichts.
         </p>
         <ServerSelect choice={choice} custom={custom} onChoice={setChoice} onCustom={setCustom} />
         <Field label="E-Mail">
@@ -298,13 +310,29 @@ const STATE_TEXT: Record<CompareState, string> = {
   info: "",
 };
 
-function RawEndpoints({ raw }: { raw: Record<string, unknown> }) {
+function RawEndpoints({ raw, live }: { raw: Record<string, unknown>; live: boolean }) {
+  // Raw bodies of the production server can hold customer data, so they stay closed there.
+  const [shown, setShown] = useState(!live);
   const entries = Object.entries(raw);
+  if (live && !shown) {
+    return (
+      <div className="raw">
+        <button type="button" className="btn" onClick={() => setShown(true)}>
+          Rohdaten anzeigen
+        </button>
+      </div>
+    );
+  }
   if (entries.length === 0)
     return <p className="muted">Der Server hat keine Rohdaten geliefert.</p>;
   return (
     <div className="raw">
       <h4>Rohdaten je Endpunkt</h4>
+      {live ? (
+        <button type="button" className="btn" onClick={() => setShown(false)}>
+          Rohdaten ausblenden
+        </button>
+      ) : null}
       {entries.map(([path, body]) => (
         <details key={path} className="collapsible">
           <summary className="mono">{path}</summary>
@@ -365,10 +393,10 @@ function LoggedInView({ box }: { box: ChargePointSnapshot }) {
   return (
     <div className="appview">
       <div className="appview-bar">
-        <p className="muted">Nur lesend. Abruf höchstens alle 30 Sekunden.</p>
+        <p className="muted">Nur lesend. Automatischer Abruf alle {APP_POLL_SECONDS} Sekunden.</p>
         <div className="button-row">
           <button type="button" className="btn" disabled={busy} onClick={() => void refresh()}>
-            Jetzt abrufen
+            Abrufen
           </button>
           <button type="button" className="btn" onClick={() => void logout()}>
             Abmelden
@@ -394,7 +422,7 @@ function LoggedInView({ box }: { box: ChargePointSnapshot }) {
             <thead>
               <tr>
                 <th scope="col">Merkmal</th>
-                <th scope="col">Box meldet</th>
+                <th scope="col">Wallbox meldet</th>
                 <th scope="col">App bekommt</th>
               </tr>
             </thead>
@@ -451,7 +479,7 @@ function LoggedInView({ box }: { box: ChargePointSnapshot }) {
               </table>
             )}
           </div>
-          <RawEndpoints raw={snapshot.raw} />
+          <RawEndpoints raw={snapshot.raw} live={state.app.live} />
         </>
       ) : error === null ? (
         <p className="empty">Die App-Sicht wird abgerufen.</p>

@@ -75,3 +75,9 @@ export function formatElapsed(totalSeconds: number): string {
   const s = Math.max(0, Math.floor(totalSeconds));
   return `${Math.floor(s / 60)}:${pad(s % 60)} min`;
 }
+
+/** "06.10.2026, 20:15:03" */
+export function formatStand(iso: string): string {
+  const full = formatDateTime(iso);
+  return full === DASH ? DASH : full.replace(" ", ", ");
+}

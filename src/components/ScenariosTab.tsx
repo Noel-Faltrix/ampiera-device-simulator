@@ -39,21 +39,47 @@ function OutcomeIcon({ outcome }: { outcome: CheckOutcome }) {
   );
 }
 
-function ReportView({ report }: { report: ScenarioReport }) {
-  const [copyState, setCopyState] = useState<{ ok: boolean; text: string } | null>(null);
+function ReportView({
+  report,
+  markdown,
+}: {
+  report: ScenarioReport;
+  markdown: string | undefined;
+}) {
+  const [feedback, setFeedback] = useState<{ ok: boolean; text: string } | null>(null);
 
-  async function copy() {
+  // The clipboard write must happen inside the click, so the markdown is fetched beforehand.
+  function copy() {
+    if (markdown === undefined) return;
+    navigator.clipboard.writeText(markdown).then(
+      () => setFeedback({ ok: true, text: "Bericht kopiert." }),
+      (e: unknown) =>
+        setFeedback({ ok: false, text: `Kopieren fehlgeschlagen: ${errorMessage(e)}` }),
+    );
+  }
+
+  async function save() {
     try {
-      const markdown = await api.exportReport(report);
-      await navigator.clipboard.writeText(markdown);
-      setCopyState({ ok: true, text: "Bericht kopiert." });
+      const path = await api.saveReport(report);
+      setFeedback({ ok: true, text: `Gespeichert unter ${path}` });
     } catch (e) {
-      setCopyState({ ok: false, text: `Kopieren fehlgeschlagen: ${errorMessage(e)}` });
+      setFeedback({ ok: false, text: errorMessage(e) });
     }
   }
 
   return (
     <div className="report">
+      {report.chargePointLabel ? (
+        <p className="muted">
+          Wallbox: {report.chargePointLabel}
+          {report.chargePointIdentity ? (
+            <>
+              {" "}
+              (<span className="mono">{report.chargePointIdentity}</span>)
+            </>
+          ) : null}
+        </p>
+      ) : null}
       <div className="report-head">
         <span className={`result result-${report.outcome}`}>
           Ergebnis: {OVERALL_TEXT[report.outcome]}
@@ -61,12 +87,15 @@ function ReportView({ report }: { report: ScenarioReport }) {
         <span className="muted">
           {formatDateTime(report.startedAt)} bis {formatDateTime(report.finishedAt)}
         </span>
-        <button type="button" className="btn" onClick={() => void copy()}>
+        <button type="button" className="btn" disabled={markdown === undefined} onClick={copy}>
           Bericht kopieren
         </button>
-        {copyState ? (
-          <span role="status" className={copyState.ok ? "muted" : "text-critical"}>
-            {copyState.text}
+        <button type="button" className="btn" onClick={() => void save()}>
+          Bericht speichern
+        </button>
+        {feedback ? (
+          <span role="status" className={feedback.ok ? "muted" : "text-critical"}>
+            {feedback.text}
           </span>
         ) : null}
       </div>
@@ -104,16 +133,29 @@ function ScenarioRow({ box, scenario }: ScenarioRowProps) {
   const report = state.reports[reportKey(box.id, scenario.id)];
   const now = useNow(isRunning);
   const reasonId = `scenario-${scenario.id}-reason`;
+  const [announce, setAnnounce] = useState("");
+  const blockReason = blockedByLive
+    ? "Dieses Szenario läuft nur auf lokalen Wallboxen, weil es auf dem Produktivserver den Betrieb beeinträchtigen könnte."
+    : otherRunning
+      ? "Auf dieser Wallbox läuft bereits ein Szenario."
+      : null;
 
   async function start() {
     setError(null);
+    setAnnounce("Szenario gestartet");
     dispatch({ type: "runStarted", id: box.id, scenarioId: scenario.id, at: Date.now() });
     try {
       const result = await api.runScenario(box.id, scenario.id);
       dispatch({ type: "report", report: result });
+      void api.exportReport(result).then(
+        (markdown) =>
+          dispatch({ type: "reportMarkdown", key: reportKey(box.id, scenario.id), markdown }),
+        () => {},
+      );
     } catch (e) {
       setError(errorMessage(e));
     } finally {
+      setAnnounce("Szenario beendet");
       dispatch({ type: "runEnded", id: box.id });
     }
   }
@@ -132,16 +174,16 @@ function ScenarioRow({ box, scenario }: ScenarioRowProps) {
         <div className="scenario-title">
           <span className="mono scenario-id">{scenario.id}</span>
           <h3>{scenario.title}</h3>
-          {scenario.needsHuman ? (
-            <span className="badge badge-info">braucht Mitwirkung</span>
+          {scenario.needsHuman ? <span className="badge badge-info">Handlung nötig</span> : null}
+          {!scenario.liveAllowed ? (
+            <span className="badge badge-local-only">nur lokal ausführbar</span>
           ) : null}
-          {!scenario.liveAllowed ? <span className="badge badge-local">nur lokal</span> : null}
-          <span className="muted">Timeout {formatTimeout(scenario.timeoutS)}</span>
+          <span className="muted">Zeitlimit {formatTimeout(scenario.timeoutS)}</span>
         </div>
         <div className="button-row">
           {isRunning ? (
             <>
-              <span role="status" className="muted">
+              <span className="muted" aria-hidden="true">
                 Läuft seit {formatElapsed((now - (running?.startedAt ?? now)) / 1000)}
               </span>
               <button type="button" className="btn" onClick={() => void abort()}>
@@ -151,26 +193,28 @@ function ScenarioRow({ box, scenario }: ScenarioRowProps) {
           ) : (
             <button
               type="button"
-              className="btn btn-primary"
-              disabled={blockedByLive || otherRunning}
-              aria-describedby={blockedByLive ? reasonId : undefined}
+              className={isLive ? "btn btn-primary" : "btn"}
+              disabled={blockReason !== null}
+              aria-describedby={blockReason ? reasonId : undefined}
               onClick={() => void start()}
             >
-              Starten
+              {isLive ? "Auf Live starten" : "Starten"}
             </button>
           )}
         </div>
       </div>
       <p className="scenario-desc">{scenario.description}</p>
-      {blockedByLive ? (
+      <span className="sr-only" role="status">
+        {announce}
+      </span>
+      {blockReason ? (
         <p id={reasonId} className="field-hint">
-          Dieses Szenario läuft nur auf lokalen Boxen, weil es auf dem Produktivserver den Betrieb
-          beeinträchtigen könnte.
+          {blockReason}
         </p>
       ) : null}
-      {scenario.needsHuman && !blockedByLive ? (
+      {scenario.needsHuman ? (
         <p className="field-hint">
-          Für dieses Szenario musst du selbst etwas auslösen, siehe Beschreibung.
+          Du musst dafür selbst etwas auslösen. Die Beschreibung sagt, was.
         </p>
       ) : null}
       {error ? (
@@ -178,7 +222,12 @@ function ScenarioRow({ box, scenario }: ScenarioRowProps) {
           {error}
         </p>
       ) : null}
-      {report ? <ReportView report={report} /> : null}
+      {report ? (
+        <ReportView
+          report={report}
+          markdown={state.reportMarkdown[reportKey(box.id, scenario.id)]}
+        />
+      ) : null}
     </li>
   );
 }

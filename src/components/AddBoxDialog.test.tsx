@@ -20,7 +20,7 @@ describe("AddBoxDialog", () => {
 
   it("prefills the contract defaults", () => {
     render(<AddBoxDialog onClose={() => {}} onAdded={() => {}} />);
-    expect(screen.getByLabelText("Server-Adresse")).toHaveValue("ws://localhost:9000/ocpp");
+    expect(screen.getByLabelText("Adresse der Zentrale")).toHaveValue("ws://localhost:9000/ocpp");
     expect(screen.getByLabelText("Hersteller")).toHaveValue("Ampiera Sim");
     expect(screen.getByLabelText("Modell")).toHaveValue("Device Simulator");
     expect(screen.getByLabelText("Max. Leistung (kW)")).toHaveValue("11");
@@ -35,16 +35,18 @@ describe("AddBoxDialog", () => {
 
     await user.click(screen.getByLabelText("Live"));
     expect(
-      screen.getByText(/Diese Box verbindet sich mit dem Produktivserver api\.ampiera\.de/),
+      screen.getByText(
+        /Diese Wallbox verbindet sich mit dem Produktivserver api\.ampiera\.de\. Verwende nur die Kennung einer Simulationsanlage\. Es sind höchstens 3 Live-Wallboxen/,
+      ),
     ).toBeInTheDocument();
-    expect(screen.getByLabelText("Server-Adresse")).toHaveValue("wss://api.ampiera.de/ocpp");
+    expect(screen.getByLabelText("Adresse der Zentrale")).toHaveValue("wss://api.ampiera.de/ocpp");
 
     const submit = screen.getByRole("button", { name: "Anlegen" });
     expect(submit).toBeDisabled();
     await user.click(submit);
     expect(api.addChargePoint).not.toHaveBeenCalled();
 
-    await user.click(screen.getByLabelText(/Ich verstehe das/));
+    await user.click(screen.getByLabelText(/Ich nutze die Kennung einer Simulationsanlage/));
     expect(submit).toBeEnabled();
     await user.click(submit);
 
@@ -68,21 +70,57 @@ describe("AddBoxDialog", () => {
     expect(vi.mocked(api.addChargePoint).mock.calls[0]![0].liveConfirmed).toBe(false);
   });
 
+  it("titles the dialog as live and requires the live target for public hosts", async () => {
+    const user = userEvent.setup();
+    render(<AddBoxDialog onClose={() => {}} onAdded={() => {}} />);
+    expect(screen.getByRole("heading", { name: "Wallbox hinzufügen" })).toBeInTheDocument();
+    await fillBasics(user);
+    const url = screen.getByLabelText("Adresse der Zentrale");
+    await user.clear(url);
+    await user.type(url, "wss://api.ampiera.de/ocpp");
+    await user.click(screen.getByRole("button", { name: "Anlegen" }));
+    expect(screen.getByText(/nicht im lokalen Netz/)).toBeInTheDocument();
+    expect(screen.getByLabelText("Adresse der Zentrale")).toHaveFocus();
+    expect(api.addChargePoint).not.toHaveBeenCalled();
+
+    await user.click(screen.getByLabelText("Live"));
+    expect(screen.getByRole("heading", { name: "Live-Wallbox hinzufügen" })).toBeInTheDocument();
+  });
+
+  it("enforces the bounds of the core", async () => {
+    const user = userEvent.setup();
+    render(<AddBoxDialog onClose={() => {}} onAdded={() => {}} />);
+    await fillBasics(user);
+    await user.clear(screen.getByLabelText("Bezeichnung"));
+    await user.type(screen.getByLabelText("Bezeichnung"), "x".repeat(61));
+    await user.clear(screen.getByLabelText("Max. Leistung (kW)"));
+    await user.type(screen.getByLabelText("Max. Leistung (kW)"), "400");
+    await user.clear(screen.getByLabelText("Uhrabweichung (s)"));
+    await user.type(screen.getByLabelText("Uhrabweichung (s)"), "90000");
+    await user.click(screen.getByRole("button", { name: "Anlegen" }));
+    expect(screen.getByText("Höchstens 60 Zeichen.")).toBeInTheDocument();
+    expect(screen.getByText(/0,001 bis 350 kW/)).toBeInTheDocument();
+    expect(screen.getByText(/zwischen -86400 und 86400/)).toBeInTheDocument();
+    expect(api.addChargePoint).not.toHaveBeenCalled();
+  });
+
   it("resets the confirmation when switching back to local", async () => {
     const user = userEvent.setup();
     render(<AddBoxDialog onClose={() => {}} onAdded={() => {}} />);
     await user.click(screen.getByLabelText("Live"));
-    await user.click(screen.getByLabelText(/Ich verstehe das/));
+    await user.click(screen.getByLabelText(/Ich nutze die Kennung einer Simulationsanlage/));
     await user.click(screen.getByLabelText("Lokal"));
     await user.click(screen.getByLabelText("Live"));
-    expect(screen.getByLabelText(/Ich verstehe das/)).not.toBeChecked();
+    expect(
+      screen.getByLabelText(/Ich nutze die Kennung einer Simulationsanlage/),
+    ).not.toBeChecked();
   });
 
   it("rejects an unencrypted address outside the private network and an invalid kennung", async () => {
     const user = userEvent.setup();
     render(<AddBoxDialog onClose={() => {}} onAdded={() => {}} />);
     await fillBasics(user);
-    const url = screen.getByLabelText("Server-Adresse");
+    const url = screen.getByLabelText("Adresse der Zentrale");
     await user.clear(url);
     await user.type(url, "ws://api.ampiera.de/ocpp");
     await user.clear(screen.getByLabelText("Kennung"));

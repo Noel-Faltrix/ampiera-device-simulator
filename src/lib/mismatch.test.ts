@@ -21,7 +21,9 @@ describe("powersAgree", () => {
 
   it("does not trip on rounding around zero", () => {
     expect(powersAgree(0, 20)).toBe(true);
+    expect(powersAgree(80, 0)).toBe(true);
     expect(powersAgree(0, 500)).toBe(false);
+    expect(powersAgree(150, 0)).toBe(false);
   });
 });
 

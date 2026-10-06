@@ -64,6 +64,7 @@ export interface ChargePointSnapshot {
   profileCount: number;
   heartbeatIntervalS: number | null;
   lastError: string | null;
+  updatedAt: string;
 }
 
 export type FrameDirection = "out" | "in";
@@ -103,6 +104,8 @@ export interface ScenarioReport {
   finishedAt: string;
   outcome: "passed" | "failed" | "aborted";
   checks: CheckResult[];
+  chargePointLabel?: string;
+  chargePointIdentity?: string;
 }
 
 export type AppLoginResult = { result: "ok" } | { result: "device_code_required" };

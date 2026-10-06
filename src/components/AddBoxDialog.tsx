@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import * as api from "../api/client";
 import type { TargetKind } from "../api/types";
+import { LIVE_BOX_HINT } from "../lib/constants";
 import { errorMessage } from "../lib/errors";
 import {
   DEFAULT_BASE_URL,
@@ -41,6 +42,20 @@ export function AddBoxDialog({ onClose, onAdded }: AddBoxDialogProps) {
   const [errors, setErrors] = useState<BoxFormErrors>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  const opener = useRef<Element | null>(document.activeElement);
+
+  useEffect(() => {
+    if (attempt === 0) return;
+    dialogRef.current?.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus();
+  }, [attempt]);
+
+  function close() {
+    const dialog = dialogRef.current;
+    if (dialog?.open && typeof dialog.close === "function") dialog.close();
+    onClose();
+    if (opener.current instanceof HTMLElement) opener.current.focus();
+  }
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -72,7 +87,10 @@ export function AddBoxDialog({ onClose, onAdded }: AddBoxDialogProps) {
     if (submitting) return;
     const found = validateBoxForm(values);
     setErrors(found);
-    if (Object.keys(found).length > 0) return;
+    if (Object.keys(found).length > 0) {
+      setAttempt((n) => n + 1);
+      return;
+    }
     if (isLive && !liveConfirmed) return;
     setSubmitting(true);
     setSubmitError(null);
@@ -83,7 +101,7 @@ export function AddBoxDialog({ onClose, onAdded }: AddBoxDialogProps) {
         liveConfirmed: isLive && liveConfirmed,
       });
       onAdded(id);
-      onClose();
+      close();
     } catch (error) {
       setSubmitError(errorMessage(error));
       setSubmitting(false);
@@ -93,18 +111,19 @@ export function AddBoxDialog({ onClose, onAdded }: AddBoxDialogProps) {
   return (
     <dialog
       ref={dialogRef}
-      className="dialog"
+      className={`dialog${isLive ? " dialog-live" : ""}`}
       aria-labelledby="add-box-title"
       onCancel={(event) => {
         event.preventDefault();
-        onClose();
+        close();
       }}
     >
       <form onSubmit={(e) => void submit(e)} noValidate>
-        <h2 id="add-box-title">Wallbox hinzufügen</h2>
+        <h2 id="add-box-title">{isLive ? "Live-Wallbox hinzufügen" : "Wallbox hinzufügen"}</h2>
+        <p className="field-hint">Mit * markierte Felder sind Pflichtfelder.</p>
 
         <div className="form-grid">
-          <Field label="Bezeichnung" error={errors.label}>
+          <Field label="Bezeichnung" required error={errors.label}>
             {(p) => (
               <input
                 {...p}
@@ -141,25 +160,23 @@ export function AddBoxDialog({ onClose, onAdded }: AddBoxDialogProps) {
 
         {isLive ? (
           <div className="notice notice-warning" role="note">
-            <p>
-              Diese Box verbindet sich mit dem Produktivserver api.ampiera.de. Nur Kennungen einer
-              Simulationsanlage verwenden. Höchstens 3 Live-Boxen gleichzeitig.
-            </p>
+            <p>{LIVE_BOX_HINT}</p>
             <label className="inline">
               <input
                 type="checkbox"
                 checked={liveConfirmed}
                 onChange={(e) => setLiveConfirmed(e.target.checked)}
               />
-              Ich verstehe das und nutze eine Kennung einer Simulationsanlage.
+              Ich nutze die Kennung einer Simulationsanlage.
             </label>
           </div>
         ) : null}
 
         <Field
-          label="Server-Adresse"
+          label="Adresse der Zentrale"
+          required
           error={errors.baseUrl}
-          hint="Die Kennung wird beim Verbinden angehängt."
+          hint="Die Kennung wird beim Verbinden angehängt. Adressen außerhalb des lokalen Netzes brauchen das Ziel Live."
         >
           {(p) => (
             <input
@@ -178,7 +195,7 @@ export function AddBoxDialog({ onClose, onAdded }: AddBoxDialogProps) {
         </Field>
 
         <div className="form-grid">
-          <Field label="Kennung" error={errors.identity}>
+          <Field label="Kennung" required error={errors.identity}>
             {(p) => (
               <input
                 {...p}
@@ -191,7 +208,7 @@ export function AddBoxDialog({ onClose, onAdded }: AddBoxDialogProps) {
               />
             )}
           </Field>
-          <Field label="Passwort" error={errors.password}>
+          <Field label="Passwort" required error={errors.password}>
             {(p) => (
               <input
                 {...p}
@@ -202,7 +219,7 @@ export function AddBoxDialog({ onClose, onAdded }: AddBoxDialogProps) {
               />
             )}
           </Field>
-          <Field label="Hersteller" error={errors.vendor}>
+          <Field label="Hersteller" required error={errors.vendor}>
             {(p) => (
               <input
                 {...p}
@@ -212,7 +229,7 @@ export function AddBoxDialog({ onClose, onAdded }: AddBoxDialogProps) {
               />
             )}
           </Field>
-          <Field label="Modell" error={errors.model}>
+          <Field label="Modell" required error={errors.model}>
             {(p) => (
               <input
                 {...p}
@@ -222,7 +239,7 @@ export function AddBoxDialog({ onClose, onAdded }: AddBoxDialogProps) {
               />
             )}
           </Field>
-          <Field label="Phasen">
+          <Field label="Phasen" required>
             {(p) => (
               <select
                 {...p}
@@ -234,7 +251,7 @@ export function AddBoxDialog({ onClose, onAdded }: AddBoxDialogProps) {
               </select>
             )}
           </Field>
-          <Field label="Max. Leistung (kW)" error={errors.maxPowerKw}>
+          <Field label="Max. Leistung (kW)" required error={errors.maxPowerKw}>
             {(p) => (
               <input
                 {...p}
@@ -245,7 +262,7 @@ export function AddBoxDialog({ onClose, onAdded }: AddBoxDialogProps) {
               />
             )}
           </Field>
-          <Field label="Uhrabweichung (s)" error={errors.clockOffsetS}>
+          <Field label="Uhrabweichung (s)" required error={errors.clockOffsetS}>
             {(p) => (
               <input
                 {...p}
@@ -259,7 +276,7 @@ export function AddBoxDialog({ onClose, onAdded }: AddBoxDialogProps) {
         </div>
 
         <fieldset className="field">
-          <legend>Verhalten der Box</legend>
+          <legend>Verhalten der Wallbox</legend>
           <label className="inline">
             <input
               type="checkbox"
@@ -274,7 +291,7 @@ export function AddBoxDialog({ onClose, onAdded }: AddBoxDialogProps) {
               checked={values.unitW}
               onChange={(e) => set("unitW", e.target.checked)}
             />
-            Einheit W akzeptieren
+            Leistungseinheit W akzeptieren
           </label>
           <label className="inline">
             <input
@@ -282,7 +299,7 @@ export function AddBoxDialog({ onClose, onAdded }: AddBoxDialogProps) {
               checked={values.unitA}
               onChange={(e) => set("unitA", e.target.checked)}
             />
-            Einheit A akzeptieren
+            Leistungseinheit A akzeptieren
           </label>
           {errors.unitW ? <p className="field-error">{errors.unitW}</p> : null}
           <label className="inline">
@@ -291,7 +308,7 @@ export function AddBoxDialog({ onClose, onAdded }: AddBoxDialogProps) {
               checked={values.rejectProfiles}
               onChange={(e) => set("rejectProfiles", e.target.checked)}
             />
-            Profile ablehnen
+            Ladeprofile ablehnen
           </label>
         </fieldset>
 
@@ -302,7 +319,7 @@ export function AddBoxDialog({ onClose, onAdded }: AddBoxDialogProps) {
         ) : null}
 
         <div className="dialog-actions">
-          <button type="button" className="btn" onClick={onClose}>
+          <button type="button" className="btn" onClick={close}>
             Abbrechen
           </button>
           <button

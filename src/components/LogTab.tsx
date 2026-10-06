@@ -1,6 +1,8 @@
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import * as api from "../api/client";
 import type { ChargePointSnapshot } from "../api/types";
+import { DirectionLabel } from "./badges";
+import { FRAME_CAP } from "../lib/constants";
 import { errorMessage } from "../lib/errors";
 import { formatTimeMs } from "../lib/format";
 import { annotateFrames, filterFrames, frameKey, prettyFrame } from "../lib/frames";
@@ -14,7 +16,7 @@ export function LogTab({ box }: { box: ChargePointSnapshot }) {
   const frames = state.frames[box.id] ?? NO_FRAMES;
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState<number | null>(null);
-  const [exportError, setExportError] = useState<string | null>(null);
+  const [exportNote, setExportNote] = useState<{ ok: boolean; text: string } | null>(null);
   const [stuck, setStuck] = useState(true);
   const scroller = useRef<HTMLDivElement>(null);
 
@@ -33,19 +35,12 @@ export function LogTab({ box }: { box: ChargePointSnapshot }) {
   }
 
   async function exportLog() {
-    setExportError(null);
+    setExportNote(null);
     try {
-      const json = await api.exportLog(box.id);
-      const url = URL.createObjectURL(new Blob([json], { type: "application/json" }));
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = `protokoll-${box.config.identity}-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      URL.revokeObjectURL(url);
+      const path = await api.saveLog(box.id);
+      setExportNote({ ok: true, text: `Gespeichert unter ${path}` });
     } catch (e) {
-      setExportError(errorMessage(e));
+      setExportNote({ ok: false, text: errorMessage(e) });
     }
   }
 
@@ -65,20 +60,24 @@ export function LogTab({ box }: { box: ChargePointSnapshot }) {
         </div>
         <span className="muted" aria-live="polite">
           {visible.length} von {frames.length} Einträgen
+          {frames.length >= FRAME_CAP ? " (gekürzt)" : ""}
         </span>
         <button type="button" className="btn" onClick={() => void exportLog()}>
           Exportieren
         </button>
       </div>
-      {exportError ? (
-        <p className="notice notice-critical" role="alert">
-          {exportError}
+      {exportNote ? (
+        <p
+          role={exportNote.ok ? "status" : "alert"}
+          className={exportNote.ok ? "muted" : "notice notice-critical"}
+        >
+          {exportNote.text}
         </p>
       ) : null}
       {frames.length === 0 ? (
         <p className="empty">
-          Noch kein Datenverkehr. Sobald die Box sich mit der Zentrale verbindet, erscheinen hier
-          alle OCPP-Nachrichten.
+          Noch kein Datenverkehr. Sobald die Wallbox sich mit der Zentrale verbindet, erscheinen
+          hier die letzten {FRAME_CAP} OCPP-Nachrichten.
         </p>
       ) : visible.length === 0 ? (
         <p className="empty">Keine Nachricht passt zum Filter.</p>
@@ -91,6 +90,12 @@ export function LogTab({ box }: { box: ChargePointSnapshot }) {
           role="region"
           aria-label="OCPP-Nachrichten"
         >
+          <div className="frame-head" aria-hidden="true">
+            <span>Zeit (Ortszeit)</span>
+            <span>Richtung</span>
+            <span>Aktion</span>
+            <span>Nachricht</span>
+          </div>
           <ul className="frames">
             {visible.map(({ entry, kind, action }) => {
               const key = frameKey(entry);
@@ -105,7 +110,7 @@ export function LogTab({ box }: { box: ChargePointSnapshot }) {
                   >
                     <span className="mono frame-time">{formatTimeMs(entry.at)}</span>
                     <span className="frame-dir">
-                      {entry.direction === "out" ? "→ Zentrale" : "← Zentrale"}
+                      <DirectionLabel direction={entry.direction} />
                     </span>
                     <span className="mono frame-action">
                       {action ?? "?"}

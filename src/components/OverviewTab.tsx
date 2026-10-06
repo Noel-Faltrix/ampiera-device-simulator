@@ -9,6 +9,7 @@ import {
   formatPercent,
   formatPower,
   formatRawLimit,
+  formatStand,
 } from "../lib/format";
 import { parseVehicleForm, type VehicleFormValues } from "../lib/validation";
 import { useSim } from "../state/store";
@@ -69,6 +70,10 @@ export function OverviewTab({ box }: { box: ChargePointSnapshot }) {
 
   return (
     <div className="overview">
+      <p className="stand">
+        Stand: {formatStand(box.updatedAt)}
+        {state !== "connected" ? ". Werte vom letzten Kontakt." : null}
+      </p>
       <table className="kv">
         <tbody>
           <tr>
@@ -92,19 +97,12 @@ export function OverviewTab({ box }: { box: ChargePointSnapshot }) {
             <td>
               {plugged && box.vehicle ? (
                 <div className="soc">
-                  <div
+                  <progress
                     className="soc-bar"
-                    role="progressbar"
                     aria-label="Ladestand des Fahrzeugs"
-                    aria-valuemin={0}
-                    aria-valuemax={100}
-                    aria-valuenow={Math.round(box.vehicle.socPct)}
-                  >
-                    <div
-                      className="soc-fill"
-                      style={{ width: `${Math.min(100, Math.max(0, box.vehicle.socPct))}%` }}
-                    />
-                  </div>
+                    max={100}
+                    value={Math.min(100, Math.max(0, box.vehicle.socPct))}
+                  />
                   <span>{formatPercent(box.vehicle.socPct)}</span>
                 </div>
               ) : (
@@ -130,7 +128,7 @@ export function OverviewTab({ box }: { box: ChargePointSnapshot }) {
                   <span>{formatCountdown(limit.validTo, now)}</span>
                 </div>
               ) : (
-                "Keine Grenze aktiv, die Box lädt mit ihrem eigenen Maximum."
+                "Keine Grenze aktiv, die Wallbox lädt mit ihrem eigenen Maximum."
               )}
             </td>
           </tr>
@@ -170,7 +168,7 @@ export function OverviewTab({ box }: { box: ChargePointSnapshot }) {
             disabled={busy || !plugged}
             onClick={() => void run(() => api.unplug(box.id))}
           >
-            Auto abziehen
+            Fahrzeug abstecken
           </button>
           <button
             type="button"
@@ -178,18 +176,18 @@ export function OverviewTab({ box }: { box: ChargePointSnapshot }) {
             disabled={busy}
             onClick={() => void run(() => api.reboot(box.id))}
           >
-            Box neu starten
+            Wallbox neu starten
           </button>
           {confirmRemove ? (
             <span className="confirm" role="group" aria-label="Entfernen bestätigen">
-              <span>Wallbox wirklich entfernen?</span>
+              <span>Wallbox entfernen?</span>
               <button
                 type="button"
                 className="btn btn-danger"
                 disabled={busy}
                 onClick={() => void remove()}
               >
-                Ja, entfernen
+                Entfernen
               </button>
               <button type="button" className="btn" onClick={() => setConfirmRemove(false)}>
                 Abbrechen
@@ -208,7 +206,7 @@ export function OverviewTab({ box }: { box: ChargePointSnapshot }) {
         </div>
 
         <form className="vehicle-form" onSubmit={(e) => void submitVehicle(e)} noValidate>
-          <h4>Auto anstecken</h4>
+          <h4>Fahrzeug anstecken</h4>
           <div className="form-grid form-grid-4">
             <Field label="Akku (kWh)">
               {(p) => (
@@ -260,9 +258,12 @@ export function OverviewTab({ box }: { box: ChargePointSnapshot }) {
           </div>
           {vehicleError ? <p className="field-error">{vehicleError}</p> : null}
           <button type="submit" className="btn btn-primary" disabled={busy || plugged}>
-            Auto anstecken
+            Fahrzeug anstecken
           </button>
-          {plugged ? <p className="field-hint">Es ist bereits ein Fahrzeug angesteckt.</p> : null}
+          <p className="field-hint">
+            Voreinstellungen eines Standardfahrzeugs. Passe sie bei Bedarf an.
+            {plugged ? " Es ist bereits ein Fahrzeug angesteckt." : ""}
+          </p>
         </form>
 
         {error ? (

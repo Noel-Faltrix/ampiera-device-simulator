@@ -17,17 +17,35 @@ export function BoxList({ onAdd }: BoxListProps) {
           Wallbox hinzufügen
         </button>
       </div>
+      {state.restoreProblems.length > 0 ? (
+        <ul className="problems" aria-label="Hinweise zur Wiederherstellung">
+          {state.restoreProblems.map((message, index) => (
+            <li key={`${index}-${message}`} className="notice notice-warning problem">
+              <span>Nicht wiederhergestellt: {message}</span>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => dispatch({ type: "dismissProblem", index })}
+              >
+                Schließen
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : null}
       {state.loadError ? (
         <p className="notice notice-critical" role="alert">
           Die Wallboxen konnten nicht geladen werden: {state.loadError}
         </p>
       ) : null}
       {boxes.length === 0 ? (
-        state.ready && !state.loadError ? (
+        state.loadError ? null : state.ready ? (
           <p className="empty">
             Noch keine Wallbox angelegt. Lege eine an, um dich mit der Zentrale zu verbinden.
           </p>
-        ) : null
+        ) : (
+          <p className="empty">Wallboxen werden geladen.</p>
+        )
       ) : (
         <ul className="box-list">
           {boxes.map((box) => (
